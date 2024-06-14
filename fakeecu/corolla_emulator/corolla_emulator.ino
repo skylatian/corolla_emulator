@@ -56,21 +56,23 @@ unsigned char not_in_d[] = {0x0, 0x20, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0};
 void setup()
 {
   Serial.begin(115200);
-  //Setup Pins
+  delay(3000);
+  Serial.println("beginning...");
+
+  // Setup Pins
   for (inc = 0; inc <= 4; inc++) {
     pinMode(pins[inc], INPUT);
   }
-  //tries to initialize, if failed --> it will loop here for ever
+  // tries to initialize, if failed --> it will loop here for ever
 START_INIT:
 
-  if (CAN_OK == CAN.begin(CAN_500KBPS))     //setting CAN baud rate to 500Kbps
-  {
+  //if (CAN_OK == CAN.begin(CAN_500KBPS)) {     // setting CAN baud rate to 500Kbps
+  if(CAN.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) == CAN_OK) { // library needed more arguments
     Serial.println("CAN BUS Shield init ok!");
-  }
-  else
-  {
+  } else {
     goto START_INIT;
   }
+  CAN.setMode(MCP_NORMAL);   // Change to normal mode to allow messages to be transmitted
 }
 
 void loop()
