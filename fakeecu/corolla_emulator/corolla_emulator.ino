@@ -15,13 +15,12 @@ MCP_CAN CAN(10);  // SPI chip select pin 10
 // ============================================================================
 // FLAG-BASED CONFIGURATION
 // Toggle these to control which messages the emulator sends.
-// Defaults match the recommended setup for real EPS+SAS on the bus.
 // ============================================================================
 
 // Set to true when real hardware is connected and provides these messages.
 // Set to false to have the emulator spoof them (bench testing without EPS/SAS).
-#define REAL_EPS_CONNECTED    true   // EPS provides 0x260 (STEER_TORQUE_SENSOR), 0x262 (EPS_STATUS)
-#define REAL_SAS_CONNECTED    true   // SAS provides 0x25 (STEER_ANGLE_SENSOR)
+#define REAL_EPS_CONNECTED    false  // EPS provides 0x260 (STEER_TORQUE_SENSOR), 0x262 (EPS_STATUS)
+#define REAL_SAS_CONNECTED    false  // SAS provides 0x25 (STEER_ANGLE_SENSOR)
 
 // Messages the emulator can send. Defaults are what FrogPilot needs.
 #define SEND_ACC_CONTROL      false  // 0x343 — WARNING: triggers relay_malfunction if true!
@@ -32,8 +31,10 @@ MCP_CAN CAN(10);  // SPI chip select pin 10
 #define SEND_WHEEL_SPEEDS     true   // 0xAA  — required by panda safety RX checks (83 Hz)
 #define SEND_SPEED            true   // 0xB4  — vehicle speed (also EPS init message)
 #define SEND_PCM_CRUISE       true   // 0x1D2 — cruise state (required by panda safety)
-#define SEND_ENGINE_RPM       true   // 0x1C4 — EPS init message
+#define SEND_ENGINE_RPM       true   // 0x1C4 — EPS init message (42 Hz required by carstate)
 #define SEND_EPS_INIT_4CB     true   // 0x4CB — EPS init message
+#define SEND_PRE_COLLISION    true   // 0x283 — required by carstate for non-TSS2 without DSU
+#define SEND_VSC1S07          true   // 0x320 — vehicle stability control (20 Hz required)
 
 // Send the bulk "background" messages from the original emulator (0x367, 0x394, etc.)
 // These fill out the CAN bus to look more like a real car. Not strictly required.
@@ -49,17 +50,16 @@ MCP_CAN CAN(10);  // SPI chip select pin 10
 #define SPEED_POT_PIN      A0  // Potentiometer for wheel/vehicle speed
 
 // ============================================================================
-// TIMING (millis-based, non-blocking)
+// TIMING (micros-based, non-blocking)
 // ============================================================================
 
 // Interval in microseconds for each frequency tier
-// Using micros() for better precision at high frequencies
-#define INTERVAL_83HZ   12048   // ~83 Hz (12.048 ms) — WHEEL_SPEEDS
-#define INTERVAL_50HZ   20000   // 50 Hz (20 ms) — STEER_TORQUE_SENSOR, SPEED
+#define INTERVAL_83HZ   12048   // ~83 Hz (12.048 ms) — WHEEL_SPEEDS, STEER_ANGLE_SENSOR
+#define INTERVAL_50HZ   20000   // 50 Hz (20 ms) — STEER_TORQUE_SENSOR, SPEED, ENGINE_RPM, VSC1S07
 #define INTERVAL_40HZ   25000   // 40 Hz (25 ms) — BRAKE_MODULE
-#define INTERVAL_33HZ   30303   // ~33 Hz (30.3 ms) — PCM_CRUISE, PCM_CRUISE_2
+#define INTERVAL_33HZ   30303   // ~33 Hz (30.3 ms) — PCM_CRUISE, PCM_CRUISE_2, PRE_COLLISION
 #define INTERVAL_25HZ   40000   // 25 Hz (40 ms) — EPS_STATUS
-#define INTERVAL_10HZ   100000  // 10 Hz — ENGINE_RPM, background msgs
+#define INTERVAL_10HZ   100000  // 10 Hz — background msgs
 #define INTERVAL_3HZ    333333  // ~3 Hz — BODY_CONTROL_STATE
 #define INTERVAL_1HZ    1000000 // 1 Hz — GEAR_PACKET, 0x4CB
 
@@ -129,13 +129,14 @@ void send_wheel_speeds(uint16_t spd) {
   sendMsg(0xAA, data, 8);
 }
 
-// 0xB4 — SPEED (7 bytes, no checksum from panda)
-// Vehicle speed in bytes 4-5
+// 0xB4 — SPEED (8 bytes, toyota_checksum)
+// Vehicle speed in bytes 5-6 (big endian), checksum in byte 7
 void send_speed(uint16_t spd) {
-  uint8_t w1 = (spd >> 8);
-  uint8_t w2 = spd & 0xFF;
-  uint8_t data[7] = {0, 0, 0, 0, w1, w2, 0};
-  sendMsg(0xB4, data, 7);
+  uint8_t data[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  data[5] = (spd >> 8);
+  data[6] = spd & 0xFF;
+  data[7] = toyota_checksum(0xB4, data, 8);
+  sendMsg(0xB4, data, 8);
 }
 
 // 0x1D2 — PCM_CRUISE (8 bytes, toyota_checksum)
@@ -156,24 +157,25 @@ void send_pcm_cruise(bool cruise_active) {
   sendMsg(0x1D2, data, 8);
 }
 
-// 0x1D3 — PCM_CRUISE_2 (8 bytes, no checksum from panda)
+// 0x1D3 — PCM_CRUISE_2 (8 bytes, toyota_checksum)
 // Byte 2 bit 1: MAIN_ON
 void send_pcm_cruise_2(bool main_on) {
   uint8_t data[8] = {0, 0, 0, 0, 0, 0, 0, 0};
   if (main_on) {
     data[2] = 0x02;  // MAIN_ON = bit 1
   }
+  data[7] = toyota_checksum(0x1D3, data, 8);
   sendMsg(0x1D3, data, 8);
 }
 
-// 0x224 — BRAKE_MODULE (8 bytes, no checksum from panda)
+// 0x224 — BRAKE_MODULE (8 bytes, no checksum in DBC)
 // Byte 0 bit 5: BRAKE_PRESSED
 void send_brake_module() {
   // All zeros = brake not pressed
   sendMsg(0x224, zeros, 8);
 }
 
-// 0x3BC — GEAR_PACKET (8 bytes)
+// 0x3BC — GEAR_PACKET (8 bytes, no checksum in DBC)
 // Byte 1: gear position. 0x00 = Drive, 0x20 = not-in-drive (Park/Neutral)
 void send_gear_packet(bool in_drive) {
   uint8_t data[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -183,13 +185,13 @@ void send_gear_packet(bool in_drive) {
   sendMsg(0x3BC, data, 8);
 }
 
-// 0x620 — BODY_CONTROL_STATE (8 bytes)
+// 0x620 — BODY_CONTROL_STATE (8 bytes, no checksum in DBC)
 // Doors closed, seatbelt on — all zeros is safe defaults
 void send_body_control() {
   sendMsg(0x620, zeros, 8);
 }
 
-// 0x1C4 — ENGINE_RPM (8 bytes)
+// 0x1C4 — ENGINE_RPM (8 bytes, no checksum in DBC)
 void send_engine_rpm() {
   sendMsg(0x1C4, zeros, 8);
 }
@@ -210,18 +212,34 @@ void send_steer_torque_sensor() {
   sendMsg(0x260, data, 8);
 }
 
-// 0x25 — STEER_ANGLE_SENSOR (8 bytes)
+// 0x25 — STEER_ANGLE_SENSOR (8 bytes, no checksum in DBC)
 // Only sent when REAL_SAS_CONNECTED is false (bench testing)
 void send_steer_angle_sensor() {
   sendMsg(0x25, zeros, 8);
 }
 
-// 0x262 — EPS_STATUS (5 bytes)
+// 0x262 — EPS_STATUS (5 bytes, toyota_checksum)
 // Only sent when REAL_EPS_CONNECTED is false (bench testing)
 // LKA_STATE in this message — OP checks for steer faults
 void send_eps_status() {
   uint8_t data[5] = {0, 0, 0, 0, 0};
+  data[4] = toyota_checksum(0x262, data, 5);
   sendMsg(0x262, data, 5);
+}
+
+// 0x283 — PRE_COLLISION (7 bytes, toyota_checksum)
+// Required by carstate for non-TSS2 cars without DSU and without DISABLE_RADAR
+// PRECOLLISION_ACTIVE=0, FORCE=0 (no AEB active)
+void send_pre_collision() {
+  uint8_t data[7] = {0, 0, 0, 0, 0, 0, 0};
+  data[6] = toyota_checksum(0x283, data, 7);
+  sendMsg(0x283, data, 7);
+}
+
+// 0x320 — VSC1S07 (8 bytes, no checksum in DBC)
+// Vehicle stability control grade — required by carstate at 20 Hz
+void send_vsc1s07() {
+  sendMsg(0x320, zeros, 8);
 }
 
 // 0x343 — ACC_CONTROL (8 bytes)
@@ -246,20 +264,21 @@ const uint8_t  bg_2byte_count = 3;
 const uint16_t bg_4byte[]  = {0x351, 0x3BB, 0xBA};
 const uint8_t  bg_4byte_count = 3;
 
-const uint16_t bg_5byte[]  = {0x2E4, 0x3E6};  // Note: 0x262 removed (real EPS sends it)
+const uint16_t bg_5byte[]  = {0x2E4, 0x3E6};  // Note: 0x262 removed (emulator or real EPS sends it)
 const uint8_t  bg_5byte_count = 2;
 
 const uint16_t bg_6byte[]  = {0x1AA, 0x384, 0x386};
 const uint8_t  bg_6byte_count = 3;
 
-const uint16_t bg_7byte[]  = {0x283, 0x365, 0x366, 0x3E7};
-const uint8_t  bg_7byte_count = 4;
+// 0x283 removed — now has dedicated sender with checksum at 33 Hz
+const uint16_t bg_7byte[]  = {0x365, 0x366, 0x3E7};
+const uint8_t  bg_7byte_count = 3;
 
-// 8-byte background messages — filtered to remove hardware-provided and dangerous IDs
-// Removed: 0x25 (SAS), 0x260 (EPS), 0x343 (stock ECU detection)
-// These are gated by their respective flags below
+// 8-byte background messages — filtered to remove IDs with dedicated senders
+// Removed: 0x25 (SAS), 0x260 (EPS), 0x320 (VSC1S07), 0x343 (stock ECU detection)
+// These are gated by their respective flags/senders
 const uint16_t bg_8byte[] = {
-  0x24, 0x1D0, 0x2C1, 0x320, 0x344,
+  0x24, 0x1D0, 0x2C1, 0x344,
   0x380, 0x381, 0x389, 0x38F, 0x399, 0x3A5, 0x3B0, 0x3B1, 0x3B7,
   0x3E8, 0x3E9, 0x3F9, 0x411, 0x412, 0x413, 0x414, 0x420,
   0x45A, 0x489, 0x48A, 0x48B, 0x4AC, 0x4D3, 0x4FF,
@@ -361,7 +380,7 @@ void setup() {
 }
 
 // ============================================================================
-// MAIN LOOP (non-blocking, millis/micros-based timing)
+// MAIN LOOP (non-blocking, micros-based timing)
 // ============================================================================
 
 void loop() {
@@ -370,16 +389,22 @@ void loop() {
   // Read speed pot once per loop
   uint16_t spd = analogRead(SPEED_POT_PIN) * 18;
 
-  // --- 83 Hz tier: WHEEL_SPEEDS ---
+  // --- 83 Hz tier: WHEEL_SPEEDS, STEER_ANGLE_SENSOR ---
+  // STEER_ANGLE_SENSOR needs 80 Hz per carstate parser
   if (now - lastMicros_83hz >= INTERVAL_83HZ) {
     lastMicros_83hz = now;
 
     #if SEND_WHEEL_SPEEDS
       send_wheel_speeds(spd);
     #endif
+
+    #if !REAL_SAS_CONNECTED
+      send_steer_angle_sensor();
+    #endif
   }
 
-  // --- 50 Hz tier: STEER_TORQUE_SENSOR (if no real EPS), SPEED ---
+  // --- 50 Hz tier: STEER_TORQUE_SENSOR, SPEED, ENGINE_RPM, VSC1S07 ---
+  // ENGINE_RPM needs 42 Hz per carstate, VSC1S07 needs 20 Hz — 50 Hz covers both
   if (now - lastMicros_50hz >= INTERVAL_50HZ) {
     lastMicros_50hz = now;
 
@@ -389,6 +414,14 @@ void loop() {
 
     #if SEND_SPEED
       send_speed(spd);
+    #endif
+
+    #if SEND_ENGINE_RPM
+      send_engine_rpm();
+    #endif
+
+    #if SEND_VSC1S07
+      send_vsc1s07();
     #endif
   }
 
@@ -401,7 +434,7 @@ void loop() {
     #endif
   }
 
-  // --- 33 Hz tier: PCM_CRUISE, PCM_CRUISE_2 ---
+  // --- 33 Hz tier: PCM_CRUISE, PCM_CRUISE_2, PRE_COLLISION ---
   if (now - lastMicros_33hz >= INTERVAL_33HZ) {
     lastMicros_33hz = now;
 
@@ -412,28 +445,24 @@ void loop() {
     #if SEND_PCM_CRUISE_2
       send_pcm_cruise_2(cruiseMain);
     #endif
+
+    #if SEND_PRE_COLLISION
+      send_pre_collision();
+    #endif
   }
 
-  // --- 25 Hz tier: EPS_STATUS (if no real EPS) ---
+  // --- 25 Hz tier: EPS_STATUS ---
   if (now - lastMicros_25hz >= INTERVAL_25HZ) {
     lastMicros_25hz = now;
 
     #if !REAL_EPS_CONNECTED
       send_eps_status();
     #endif
-
-    #if !REAL_SAS_CONNECTED
-      send_steer_angle_sensor();
-    #endif
   }
 
-  // --- 10 Hz tier: ENGINE_RPM, background messages ---
+  // --- 10 Hz tier: background messages ---
   if (now - lastMicros_10hz >= INTERVAL_10HZ) {
     lastMicros_10hz = now;
-
-    #if SEND_ENGINE_RPM
-      send_engine_rpm();
-    #endif
 
     #if SEND_BACKGROUND_MSGS
       send_background_msgs();
