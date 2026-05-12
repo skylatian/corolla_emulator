@@ -365,7 +365,7 @@ void setup() {
   pinMode(GEAR_BUTTON_PIN, INPUT);
 
   // Init MCP2515
-  while (CAN.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) != CAN_OK) {
+  while (CAN.begin(MCP_ANY, CAN_500KBPS, MCP_16MHZ) != CAN_OK) {
     Serial.println("CAN init failed, retrying...");
     delay(500);
   }
