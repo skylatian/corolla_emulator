@@ -48,6 +48,7 @@ MCP_CAN CAN(9);  // Seeed CAN Bus Shield v2: CS on D9 (not D10)
 #define MAIN_BUTTON_PIN    4   // Toggle cruise main on (0x1D3 MAIN_ON) — not used if SEND_PCM_CRUISE_2 is hardcoded on
 #define GEAR_BUTTON_PIN    5   // Toggle gear: Drive <-> Park (0x3BC)
 #define SPEED_POT_PIN      A0  // Potentiometer for wheel/vehicle speed
+#define USE_SPEED_POT      false // true = analog pot, false = serial input (type mph + enter)
 
 // ============================================================================
 // TIMING (micros-based, non-blocking)
@@ -93,6 +94,12 @@ unsigned long lastDebounce_gear   = 0;
 uint32_t txOk    = 0;
 uint32_t txError = 0;
 
+// Serial-controlled speed (when USE_SPEED_POT is false)
+// Type a number in mph into the serial monitor and hit enter
+uint16_t serialSpeedKmh100 = 0;
+char serialBuf[16];
+uint8_t serialBufIdx = 0;
+
 // ============================================================================
 // TOYOTA CHECKSUM
 // From opendbc/can/common.cc:
@@ -135,7 +142,11 @@ void print_heartbeat() {
   if (now - lastMillis_hb < HEARTBEAT_MS) return;
   lastMillis_hb = now;
 
-  uint16_t spd = analogRead(SPEED_POT_PIN) * 18;
+  #if USE_SPEED_POT
+    uint16_t spd = analogRead(SPEED_POT_PIN) * 18;
+  #else
+    uint16_t spd = 0;
+  #endif
 
   Serial.println("--- Status ---");
   Serial.print("  Cruise: "); Serial.println(cruiseEngaged ? "ENGAGED" : "off");
@@ -152,20 +163,25 @@ void print_heartbeat() {
 // ============================================================================
 
 // 0xAA — WHEEL_SPEEDS (8 bytes, no checksum)
-// 4 wheel speeds encoded as 16-bit values
-void send_wheel_speeds(uint16_t spd) {
-  uint8_t w1 = (spd >> 8);
-  uint8_t w2 = spd & 0xFF;
+// DBC: (0.01, -67.67) → physical = raw * 0.01 - 67.67
+// So raw = (km/h + 67.67) * 100
+// spd_kmh is speed in km/h * 100 (e.g., 0 km/h = 0, 30 km/h = 3000)
+void send_wheel_speeds(uint16_t spd_kmh_x100) {
+  uint16_t raw = spd_kmh_x100 + 6767;  // offset: 67.67 * 100
+  uint8_t w1 = (raw >> 8);
+  uint8_t w2 = raw & 0xFF;
   uint8_t data[8] = {w1, w2, w1, w2, w1, w2, w1, w2};
   sendMsg(0xAA, data, 8);
 }
 
 // 0xB4 — SPEED (8 bytes, toyota_checksum)
-// Vehicle speed in bytes 5-6 (big endian), checksum in byte 7
-void send_speed(uint16_t spd) {
+// DBC: SPEED signal at (47|16@0+, 0.01, 0) → physical = raw * 0.01
+// So raw = km/h * 100
+// Byte layout: signal bit 47|16@0+ means bytes 5-6 (big endian)
+void send_speed(uint16_t spd_kmh_x100) {
   uint8_t data[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-  data[5] = (spd >> 8);
-  data[6] = spd & 0xFF;
+  data[5] = (spd_kmh_x100 >> 8);
+  data[6] = spd_kmh_x100 & 0xFF;
   data[7] = toyota_checksum(0xB4, data, 8);
   sendMsg(0xB4, data, 8);
 }
@@ -350,6 +366,32 @@ void send_background_msgs() {
 }
 
 // ============================================================================
+// SERIAL SPEED INPUT
+// Type a speed in mph and press enter. E.g., "25" → 25 mph → ~40 km/h
+// ============================================================================
+
+void check_serial() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (serialBufIdx > 0) {
+        serialBuf[serialBufIdx] = '\0';
+        uint16_t mph = atoi(serialBuf);
+        serialSpeedKmh100 = (uint32_t)mph * 16093 / 100;  // mph to km/h * 100
+        Serial.print("Speed set: ");
+        Serial.print(mph);
+        Serial.print(" mph (");
+        Serial.print(serialSpeedKmh100 / 100);
+        Serial.println(" km/h)");
+        serialBufIdx = 0;
+      }
+    } else if (serialBufIdx < sizeof(serialBuf) - 1) {
+      serialBuf[serialBufIdx++] = c;
+    }
+  }
+}
+
+// ============================================================================
 // BUTTON HANDLING
 // ============================================================================
 
@@ -417,8 +459,12 @@ void setup() {
 void loop() {
   unsigned long now = micros();
 
-  // Read speed pot once per loop
-  uint16_t spd = analogRead(SPEED_POT_PIN) * 18;
+  // Speed in km/h * 100. Set via serial: type a number (mph) and hit enter.
+  #if USE_SPEED_POT
+    uint16_t spd = (uint32_t)analogRead(SPEED_POT_PIN) * 12000 / 1023;
+  #else
+    uint16_t spd = serialSpeedKmh100;
+  #endif
 
   // --- 83 Hz tier: WHEEL_SPEEDS, STEER_ANGLE_SENSOR ---
   // STEER_ANGLE_SENSOR needs 80 Hz per carstate parser
@@ -522,7 +568,8 @@ void loop() {
     #endif
   }
 
-  // --- Button handling (runs every loop, debounced internally) ---
+  // --- Serial speed input + button handling ---
+  check_serial();
   check_buttons();
 
   // --- Heartbeat: print status every 2 seconds ---
