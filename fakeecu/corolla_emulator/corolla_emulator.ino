@@ -205,11 +205,11 @@ void send_pcm_cruise(bool cruise_active) {
 }
 
 // 0x1D3 — PCM_CRUISE_2 (8 bytes, toyota_checksum)
-// Byte 2 bit 1: MAIN_ON
+// DBC: MAIN_ON at 15|1@0+ (Motorola) = byte 1, bit 7
 void send_pcm_cruise_2(bool main_on) {
   uint8_t data[8] = {0, 0, 0, 0, 0, 0, 0, 0};
   if (main_on) {
-    data[2] = 0x02;  // MAIN_ON = bit 1
+    data[1] = 0x80;  // MAIN_ON = byte 1, bit 7 (DBC bit 15 Motorola)
   }
   data[7] = toyota_checksum(0x1D3, data, 8);
   sendMsg(0x1D3, data, 8);
@@ -267,9 +267,12 @@ void send_steer_angle_sensor() {
 
 // 0x262 — EPS_STATUS (5 bytes, toyota_checksum)
 // Only sent when REAL_EPS_CONNECTED is false (bench testing)
-// LKA_STATE in this message — OP checks for steer faults
+// DBC: LKA_STATE at 31|7@0+ (Motorola) = byte 3, bits 7-1
+// LKA_STATE=0 is in TEMP_STEER_FAULTS → "steering temporarily unavailable"
+// LKA_STATE=1 means "ready" (not in any fault list)
 void send_eps_status() {
   uint8_t data[5] = {0, 0, 0, 0, 0};
+  data[3] = 0x02;  // LKA_STATE = 1 (ready) — value 1 shifted into bits 7-1
   data[4] = toyota_checksum(0x262, data, 5);
   sendMsg(0x262, data, 5);
 }
