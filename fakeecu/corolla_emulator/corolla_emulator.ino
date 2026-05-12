@@ -311,8 +311,10 @@ const uint8_t  bg_2byte_count = 3;
 const uint16_t bg_4byte[]  = {0x351, 0x3BB, 0xBA};
 const uint8_t  bg_4byte_count = 3;
 
-const uint16_t bg_5byte[]  = {0x2E4, 0x3E6};  // Note: 0x262 removed (emulator or real EPS sends it)
-const uint8_t  bg_5byte_count = 2;
+// 0x2E4 removed — that's STEERING_LKA (steering command), only openpilot should send it.
+// Sending it from the emulator triggers relay_malfunction detection.
+const uint16_t bg_5byte[]  = {0x3E6};
+const uint8_t  bg_5byte_count = 1;
 
 const uint16_t bg_6byte[]  = {0x1AA, 0x384, 0x386};
 const uint8_t  bg_6byte_count = 3;
@@ -357,9 +359,7 @@ void send_background_msgs() {
   #if !REAL_SAS_CONNECTED
     sendMsg(0x25, zeros, 8);
   #endif
-  #if !REAL_EPS_CONNECTED
-    sendMsg(0x260, zeros, 8);  // Note: no checksum in background mode
-  #endif
+  // 0x260 NOT sent here — dedicated send_steer_torque_sensor() at 50 Hz handles it with correct checksum
   #if SEND_ACC_CONTROL
     sendMsg(0x343, zeros, 8);
   #endif
