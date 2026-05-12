@@ -3,14 +3,14 @@
 // Spoofs ECU messages so openpilot (FrogPilot 0.9.7) recognizes a Toyota Corolla
 // and allows steering control via the 2016 Corolla EPS.
 //
-// Hardware: Arduino + MCP2515 (16MHz crystal)
+// Hardware: Arduino + Seeed Studio CAN Bus Shield v2 (MCP2515, 16MHz crystal, CS=D9)
 // Bus: 500kbps CAN, shared with EPS + SAS + Comma 3
 // ============================================================================
 
 #include <SPI.h>
-#include <mcp_can.h>
+#include <mcp_can.h>  // Seeed Studio CAN_BUS_Shield library
 
-MCP_CAN CAN(10);  // SPI chip select pin 10
+MCP_CAN CAN(9);  // Seeed CAN Bus Shield v2: CS on D9 (not D10)
 
 // ============================================================================
 // FLAG-BASED CONFIGURATION
