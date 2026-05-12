@@ -3,7 +3,7 @@
 // Spoofs ECU messages so openpilot (FrogPilot 0.9.7) recognizes a Toyota Corolla
 // and allows steering control via the 2016 Corolla EPS.
 //
-// Hardware: Arduino + MCP2515 (8MHz crystal)
+// Hardware: Arduino + MCP2515 (16MHz crystal)
 // Bus: 500kbps CAN, shared with EPS + SAS + Comma 3
 // ============================================================================
 
@@ -71,6 +71,8 @@ unsigned long lastMicros_25hz = 0;
 unsigned long lastMicros_10hz = 0;
 unsigned long lastMicros_3hz  = 0;
 unsigned long lastMicros_1hz  = 0;
+unsigned long lastMillis_hb   = 0;  // heartbeat
+#define HEARTBEAT_MS 2000
 
 // ============================================================================
 // STATE
@@ -86,6 +88,10 @@ unsigned long lastDebounce_cruise = 0;
 unsigned long lastDebounce_main   = 0;
 unsigned long lastDebounce_gear   = 0;
 #define DEBOUNCE_MS 300
+
+// TX error tracking
+uint32_t txOk    = 0;
+uint32_t txError = 0;
 
 // ============================================================================
 // TOYOTA CHECKSUM
@@ -113,7 +119,32 @@ uint8_t toyota_checksum(uint16_t address, uint8_t *data, uint8_t len) {
 uint8_t zeros[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 
 void sendMsg(uint16_t id, uint8_t *data, uint8_t len) {
-  CAN.sendMsgBuf(id, 0, len, data);
+  byte result = CAN.sendMsgBuf(id, 0, len, data);
+  if (result == CAN_OK) {
+    txOk++;
+  } else {
+    txError++;
+    // Uncomment for verbose TX error logging (noisy at high rates):
+    // Serial.print("TX ERR 0x"); Serial.print(id, HEX);
+    // Serial.print(" code="); Serial.println(result);
+  }
+}
+
+void print_heartbeat() {
+  unsigned long now = millis();
+  if (now - lastMillis_hb < HEARTBEAT_MS) return;
+  lastMillis_hb = now;
+
+  uint16_t spd = analogRead(SPEED_POT_PIN) * 18;
+
+  Serial.println("--- Status ---");
+  Serial.print("  Cruise: "); Serial.println(cruiseEngaged ? "ENGAGED" : "off");
+  Serial.print("  Main:   "); Serial.println(cruiseMain    ? "ON"       : "off");
+  Serial.print("  Gear:   "); Serial.println(gearInDrive   ? "Drive"    : "Park");
+  Serial.print("  Speed:  "); Serial.println(spd);
+  Serial.print("  TX ok:  "); Serial.println(txOk);
+  Serial.print("  TX err: "); Serial.println(txError);
+  Serial.println("--------------");
 }
 
 // ============================================================================
@@ -493,4 +524,7 @@ void loop() {
 
   // --- Button handling (runs every loop, debounced internally) ---
   check_buttons();
+
+  // --- Heartbeat: print status every 2 seconds ---
+  print_heartbeat();
 }
