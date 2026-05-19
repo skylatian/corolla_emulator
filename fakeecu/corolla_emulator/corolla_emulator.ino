@@ -19,8 +19,8 @@ MCP_CAN CAN(9);  // Seeed CAN Bus Shield v2: CS on D9 (not D10)
 
 // Set to true when real hardware is connected and provides these messages.
 // Set to false to have the emulator spoof them (bench testing without EPS/SAS).
-#define REAL_EPS_CONNECTED    false  // EPS provides 0x260 (STEER_TORQUE_SENSOR), 0x262 (EPS_STATUS)
-#define REAL_SAS_CONNECTED    false  // SAS provides 0x25 (STEER_ANGLE_SENSOR)
+#define REAL_EPS_CONNECTED    true  // EPS provides 0x260 (STEER_TORQUE_SENSOR), 0x262 (EPS_STATUS)
+#define REAL_SAS_CONNECTED    true  // SAS provides 0x25 (STEER_ANGLE_SENSOR)
 
 // Messages the emulator can send. Defaults are what FrogPilot needs.
 #define SEND_ACC_CONTROL      false  // 0x343 — WARNING: triggers relay_malfunction if true!
@@ -239,13 +239,16 @@ void send_body_control() {
 }
 
 // 0x1C4 — ENGINE_RPM (8 bytes, no checksum in DBC)
+// EPS requires specific data bytes for initialization (not zeros)
 void send_engine_rpm() {
-  sendMsg(0x1C4, zeros, 8);
+  uint8_t data[8] = {0x05, 0xEA, 0x1B, 0x08, 0x00, 0x00, 0xC0, 0x9F};
+  sendMsg(0x1C4, data, 8);
 }
 
-// 0x4CB — unknown EPS init message
+// 0x4CB — EPS init message (must be 40+ Hz with specific data)
 void send_eps_init_4cb() {
-  sendMsg(0x4CB, zeros, 8);
+  uint8_t data[8] = {0x66, 0x06, 0x08, 0x0A, 0x02, 0x00, 0x00, 0x00};
+  sendMsg(0x4CB, data, 8);
 }
 
 // 0x260 — STEER_TORQUE_SENSOR (8 bytes, toyota_checksum)
@@ -500,6 +503,10 @@ void loop() {
       send_engine_rpm();
     #endif
 
+    #if SEND_EPS_INIT_4CB
+      send_eps_init_4cb();
+    #endif
+
     #if SEND_VSC1S07
       send_vsc1s07();
     #endif
@@ -558,16 +565,12 @@ void loop() {
     #endif
   }
 
-  // --- 1 Hz tier: GEAR_PACKET, 0x4CB ---
+  // --- 1 Hz tier: GEAR_PACKET ---
   if (now - lastMicros_1hz >= INTERVAL_1HZ) {
     lastMicros_1hz = now;
 
     #if SEND_GEAR_PACKET
       send_gear_packet(gearInDrive);
-    #endif
-
-    #if SEND_EPS_INIT_4CB
-      send_eps_init_4cb();
     #endif
   }
 
