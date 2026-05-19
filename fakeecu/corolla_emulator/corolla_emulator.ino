@@ -21,6 +21,7 @@ MCP_CAN CAN(9);  // Seeed CAN Bus Shield v2: CS on D9 (not D10)
 // Set to false to have the emulator spoof them (bench testing without EPS/SAS).
 #define REAL_EPS_CONNECTED    true  // EPS provides 0x260 (STEER_TORQUE_SENSOR), 0x262 (EPS_STATUS)
 #define REAL_SAS_CONNECTED    true  // SAS provides 0x25 (STEER_ANGLE_SENSOR)
+#define REAL_PEDAL_CONNECTED  true  // Comma Pedal provides 0x201 (GAS_SENSOR) at 50 Hz
 
 // Messages the emulator can send. Defaults are what FrogPilot needs.
 #define SEND_ACC_CONTROL      false  // 0x343 — WARNING: triggers relay_malfunction if true!
@@ -83,6 +84,7 @@ bool cruiseEngaged = false;    // CRUISE_ACTIVE in 0x1D2
 bool cruiseMain = true;        // MAIN_ON in 0x1D3 (default on)
 bool gearInDrive = true;       // true = Drive, false = Park
 uint8_t msg_counter_1d2 = 0;  // Counter for 0x1D2 (used in checksum rotation)
+uint8_t msg_counter_201 = 0;  // Counter for 0x201 (GAS_SENSOR, 4-bit rolling)
 
 // Button debounce
 unsigned long lastDebounce_cruise = 0;
@@ -266,6 +268,30 @@ void send_steer_torque_sensor() {
 // Only sent when REAL_SAS_CONNECTED is false (bench testing)
 void send_steer_angle_sensor() {
   sendMsg(0x25, zeros, 8);
+}
+
+// 0x201 — GAS_SENSOR (6 bytes, CRC8 checksum)
+// Only sent when REAL_PEDAL_CONNECTED is false (bench testing without pedal)
+// Panda checks: counter (4-bit, max 15), frequency (50 Hz), no checksum validation
+// Carstate checks: counter + frequency via CAN parser
+void send_gas_sensor() {
+  uint8_t data[6] = {0, 0, 0, 0, 0, 0};
+  // INTERCEPTOR_GAS=0, INTERCEPTOR_GAS2=0 (no pedal input)
+  // STATE=0 (NO_FAULT) — bits 39:4 = byte 4, bits 7-4
+  // COUNTER_PEDAL — bits 35:4 = byte 4, bits 3-0
+  data[4] = (0 << 4) | (msg_counter_201 & 0x0F);  // STATE=0 | COUNTER
+  // CHECKSUM_PEDAL — byte 5 (CRC8, poly 0xD5, init 0xFF, over bytes 0-4 reversed)
+  // Panda doesn't validate checksum, but pedal firmware convention uses CRC8
+  uint8_t crc = 0xFF;
+  for (int i = 4; i >= 0; i--) {
+    crc ^= data[i];
+    for (int j = 0; j < 8; j++) {
+      crc = (crc & 0x80) ? ((crc << 1) ^ 0xD5) : (crc << 1);
+    }
+  }
+  data[5] = crc;
+  sendMsg(0x201, data, 6);
+  msg_counter_201 = (msg_counter_201 + 1) & 0x0F;
 }
 
 // 0x262 — EPS_STATUS (5 bytes, toyota_checksum)
@@ -452,9 +478,10 @@ void setup() {
   Serial.println("CAN BUS init ok!");
 
   Serial.println("--- Config ---");
-  Serial.print("REAL_EPS_CONNECTED: "); Serial.println(REAL_EPS_CONNECTED ? "true" : "false");
-  Serial.print("REAL_SAS_CONNECTED: "); Serial.println(REAL_SAS_CONNECTED ? "true" : "false");
-  Serial.print("SEND_ACC_CONTROL:   "); Serial.println(SEND_ACC_CONTROL ? "true (WARNING!)" : "false");
+  Serial.print("REAL_EPS_CONNECTED:   "); Serial.println(REAL_EPS_CONNECTED ? "true" : "false");
+  Serial.print("REAL_SAS_CONNECTED:   "); Serial.println(REAL_SAS_CONNECTED ? "true" : "false");
+  Serial.print("REAL_PEDAL_CONNECTED: "); Serial.println(REAL_PEDAL_CONNECTED ? "true" : "false");
+  Serial.print("SEND_ACC_CONTROL:     "); Serial.println(SEND_ACC_CONTROL ? "true (WARNING!)" : "false");
   Serial.println("--------------");
 }
 
@@ -493,6 +520,10 @@ void loop() {
 
     #if !REAL_EPS_CONNECTED
       send_steer_torque_sensor();
+    #endif
+
+    #if !REAL_PEDAL_CONNECTED
+      send_gas_sensor();
     #endif
 
     #if SEND_SPEED
