@@ -172,17 +172,20 @@ uint8_t stalkButtonEvent = STALK_BTN_NONE;  // Latest button event from stalk
 bool stalkMainOn = false;                    // MAIN state from stalk device
 unsigned long lastStalkMs = 0;               // millis() of last 0x69 received
 bool stalkDevicePresent = false;             // true when 0x69 seen within timeout
+bool stalkMainChanged = false;               // true when stalkMainOn changes between frames
+bool prevStalkMainOn = false;                // previous frame's MAIN state for edge detection
 #endif
 
-// Read incoming CAN messages. Non-blocking — only reads if a message is in the
-// MCP2515 RX buffer. Handles:
+// Read incoming CAN messages. Non-blocking — drains all available frames from
+// the MCP2515 RX buffers (2 deep) to prevent overflow. Handles:
 //   0xAA (WHEEL_SPEEDS) from external VSS device
 //   0x69 (CRUISE_STALK) from external stalk device
-// Drains other messages to prevent the RX buffer from filling up.
 void check_can_receive() {
   unsigned long nowMs = millis();
 
-  if (CAN.checkReceive() == CAN_MSGAVAIL) {
+  // Drain all available frames (MCP2515 has only 2 RX buffers — reading just
+  // one per loop risks dropping frames under heavy bus traffic from EPS/SAS/Pedal)
+  while (CAN.checkReceive() == CAN_MSGAVAIL) {
     unsigned long rxId;
     uint8_t rxLen;
     uint8_t rxBuf[8];
@@ -203,15 +206,38 @@ void check_can_receive() {
 
     #if AUTO_DETECT_STALK_DEVICE
     if (rxId == 0x69 && rxLen >= 2) {
-      if (rxBuf[0] != STALK_BTN_NONE) {
-        stalkButtonEvent = rxBuf[0];  // Latch non-NONE events
+      // Validate event code (0-4 are valid, reject garbage)
+      uint8_t evt = rxBuf[0];
+      if (evt != STALK_BTN_NONE && evt <= STALK_BTN_MAIN_TOGGLE) {
+        stalkButtonEvent = evt;  // Latch valid non-NONE events
       }
-      stalkMainOn = (rxBuf[1] != 0);
+
+      // Track MAIN state from every frame (not just event frames).
+      // This fixes desync when a MAIN_TOGGLE event frame is lost —
+      // the next NONE frame still carries the correct MAIN state.
+      bool newMainOn = (rxBuf[1] != 0);
+      if (newMainOn != prevStalkMainOn) {
+        stalkMainChanged = true;  // Edge detected — process in check_buttons()
+      }
+      prevStalkMainOn = newMainOn;
+      stalkMainOn = newMainOn;
       lastStalkMs = nowMs;
 
       if (!stalkDevicePresent) {
         stalkDevicePresent = true;
+        // Sync emulator state to stalk's MAIN state on first detection.
+        // Fixes boot desync (emulator defaults MAIN ON, stalk defaults OFF).
+        if (stalkMainOn && cruiseState == CRUISE_OFF) {
+          cruiseState = CRUISE_MAIN_ON;
+          update_cruise_outputs();
+        } else if (!stalkMainOn && cruiseState != CRUISE_OFF) {
+          cruiseState = CRUISE_OFF;
+          cruiseSetSpeed = 0;
+          update_cruise_outputs();
+        }
         Serial.println(F("Stalk device DETECTED — using CAN stalk input"));
+        Serial.print(F("  Synced MAIN state: "));
+        Serial.println(stalkMainOn ? "ON" : "OFF");
       }
     }
     #endif
@@ -230,7 +256,18 @@ void check_can_receive() {
   if (stalkDevicePresent && (nowMs - lastStalkMs) >= STALK_DEVICE_TIMEOUT_MS) {
     stalkDevicePresent = false;
     stalkButtonEvent = STALK_BTN_NONE;
-    Serial.println(F("Stalk device LOST — falling back to digital buttons"));
+    stalkMainChanged = false;
+    // Safety: cancel cruise on stalk device loss.
+    // Without the stalk, the driver has no physical control to disengage.
+    // Transition to CANCELLED (not OFF) so MAIN stays on and speed is
+    // preserved — driver can reconnect stalk and resume.
+    if (cruiseState == CRUISE_ENGAGED) {
+      cruiseState = CRUISE_CANCELLED;
+      update_cruise_outputs();
+      Serial.println(F("Stalk device LOST — cruise CANCELLED for safety"));
+    } else {
+      Serial.println(F("Stalk device LOST — falling back to digital buttons"));
+    }
   }
   #endif
 }
@@ -679,9 +716,25 @@ void check_buttons() {
 
   #if AUTO_DETECT_STALK_DEVICE
   // --- CAN stalk input (priority when stalk device is present) ---
-  if (stalkDevicePresent && stalkButtonEvent != STALK_BTN_NONE) {
-    process_cruise_event(stalkButtonEvent, stalkMainOn);
-    stalkButtonEvent = STALK_BTN_NONE;  // Consume the event
+  if (stalkDevicePresent) {
+    // Process button events (SET, RES, CANCEL, MAIN_TOGGLE)
+    if (stalkButtonEvent != STALK_BTN_NONE) {
+      process_cruise_event(stalkButtonEvent, stalkMainOn);
+      stalkButtonEvent = STALK_BTN_NONE;  // Consume the event
+    }
+
+    // Detect MAIN state changes from non-event frames.
+    // Fixes desync when a MAIN_TOGGLE event frame is lost: the MAIN state
+    // (byte 1) still arrives correctly on subsequent NONE frames. By
+    // detecting the edge here, we recover even without the event code.
+    if (stalkMainChanged) {
+      stalkMainChanged = false;
+      // Only act if the stalk's MAIN state disagrees with emulator state
+      bool emulatorMainOn = (cruiseState != CRUISE_OFF);
+      if (stalkMainOn != emulatorMainOn) {
+        process_cruise_event(STALK_BTN_MAIN_TOGGLE, stalkMainOn);
+      }
+    }
   }
   #endif
 
