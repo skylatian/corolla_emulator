@@ -29,18 +29,22 @@ MCP_CAN CAN(9);  // Seeed CAN Bus Shield v2: CS on D9 (not D10)
 #define SEND_PCM_CRUISE_2     true   // 0x1D3 — MAIN_ON flag (cruise availability)
 #define SEND_GEAR_PACKET      true   // 0x3BC — gear position
 #define SEND_BODY_CONTROL     true   // 0x620 — doors/seatbelt state
-#define SEND_WHEEL_SPEEDS     false   // 0xAA  — required by panda safety RX checks (83 Hz)
-#define SEND_SPEED            false   // 0xB4  — vehicle speed (also EPS init message)
+#define SEND_WHEEL_SPEEDS     true   // 0xAA  — required by panda safety RX checks (83 Hz)
+#define SEND_SPEED            true   // 0xB4  — vehicle speed (also EPS init message)
 #define SEND_PCM_CRUISE       true   // 0x1D2 — cruise state (required by panda safety)
 #define SEND_ENGINE_RPM       true   // 0x1C4 — EPS init message (42 Hz required by carstate)
 #define SEND_EPS_INIT_4CB     true   // 0x4CB — EPS init message
 #define SEND_PRE_COLLISION    true   // 0x283 — required by carstate for non-TSS2 without DSU
 #define SEND_VSC1S07          true   // 0x320 — vehicle stability control (20 Hz required)
 
-// External VSS speed device: when true, a separate Pro Micro + MCP2515 device
-// sends 0xAA (WHEEL_SPEEDS) and 0xB4 (SPEED) from the real VSS sensor.
-// The emulator reads speed from CAN (0xAA) instead of sending it.
-#define EXTERNAL_SPEED_DEVICE true
+// External VSS speed device auto-detection.
+// When true, the emulator listens for 0xAA on the CAN bus. If it receives one
+// within the timeout, it uses that speed and stops sending its own 0xAA/0xB4.
+// If the device disappears (no 0xAA for SPEED_DEVICE_TIMEOUT_MS), the emulator
+// falls back to sending 0xAA/0xB4 with speed=0.
+// When false, the emulator always sends its own 0xAA/0xB4 from SPEED_SOURCE.
+#define AUTO_DETECT_SPEED_DEVICE  true // you should only use this for debugging on the bench! should be set to false for use in car
+#define SPEED_DEVICE_TIMEOUT_MS   1000  // 1 second without 0xAA = device gone
 
 // Send the bulk "background" messages from the original emulator (0x367, 0x394, etc.)
 // These fill out the CAN bus to look more like a real car. Not strictly required.
@@ -54,14 +58,6 @@ MCP_CAN CAN(9);  // Seeed CAN Bus Shield v2: CS on D9 (not D10)
 #define MAIN_BUTTON_PIN    4   // Toggle cruise main on (0x1D3 MAIN_ON) — not used if SEND_PCM_CRUISE_2 is hardcoded on
 #define GEAR_BUTTON_PIN    5   // Toggle gear: Drive <-> Park (0x3BC)
 #define SPEED_POT_PIN      A0  // Potentiometer for wheel/vehicle speed (SPEED_SOURCE 1)
-
-// When EXTERNAL_SPEED_DEVICE is true, force off local speed message sending
-#if EXTERNAL_SPEED_DEVICE
-  #undef SEND_WHEEL_SPEEDS
-  #define SEND_WHEEL_SPEEDS false
-  #undef SEND_SPEED
-  #define SEND_SPEED false
-#endif
 
 // Speed source: 0 = serial (type mph + enter), 1 = analog pot, 2 = VSS pulse counter
 #define SPEED_SOURCE       0
@@ -143,14 +139,19 @@ void vssISR() {
 }
 #endif
 
-// CAN-received speed from external VSS device (EXTERNAL_SPEED_DEVICE)
-#if EXTERNAL_SPEED_DEVICE
-uint16_t canSpeedKmh100 = 0;  // speed in km/h * 100, read from 0xAA on bus
+// CAN-received speed from external VSS device (auto-detect)
+#if AUTO_DETECT_SPEED_DEVICE
+uint16_t canSpeedKmh100 = 0;       // speed in km/h * 100, read from 0xAA on bus
+unsigned long lastCanSpeedMs = 0;   // millis() of last 0xAA received
+bool speedDevicePresent = false;    // true when 0xAA seen within timeout
 
 // Read incoming CAN messages. Non-blocking — only reads if a message is in the
 // MCP2515 RX buffer. Extracts speed from 0xAA (WHEEL_SPEEDS) and drains other
 // messages to prevent the RX buffer from filling up.
+// Also tracks whether the external device is alive (timeout-based).
 void check_can_speed() {
+  unsigned long nowMs = millis();
+
   if (CAN.checkReceive() == CAN_MSGAVAIL) {
     unsigned long rxId;
     uint8_t rxLen;
@@ -158,11 +159,22 @@ void check_can_speed() {
     CAN.readMsgBuf(&rxId, &rxLen, rxBuf);
 
     if (rxId == 0xAA && rxLen >= 2) {
-      // First wheel speed: bytes 0-1, 16-bit BE, offset +6767
       uint16_t raw = ((uint16_t)rxBuf[0] << 8) | rxBuf[1];
       canSpeedKmh100 = (raw >= 6767) ? (raw - 6767) : 0;
+      lastCanSpeedMs = nowMs;
+
+      if (!speedDevicePresent) {
+        speedDevicePresent = true;
+        Serial.println(F("VSS device DETECTED — using CAN speed"));
+      }
     }
-    // Other CAN IDs are silently discarded (buffer drain)
+  }
+
+  // Timeout: if no 0xAA received for SPEED_DEVICE_TIMEOUT_MS, device is gone
+  if (speedDevicePresent && (nowMs - lastCanSpeedMs) >= SPEED_DEVICE_TIMEOUT_MS) {
+    speedDevicePresent = false;
+    canSpeedKmh100 = 0;
+    Serial.println(F("VSS device LOST — falling back to local speed"));
   }
 }
 #endif
@@ -223,7 +235,8 @@ void print_heartbeat() {
   Serial.print("  Gear:   "); Serial.println(gearInDrive   ? "Drive"    : "Park");
   Serial.print("  Speed:  "); Serial.println(spd);
   Serial.print("  SetSpd: "); Serial.print(cruiseSetSpeed); Serial.println(" km/h");
-  #if EXTERNAL_SPEED_DEVICE
+  #if AUTO_DETECT_SPEED_DEVICE
+  Serial.print("  VSSdev: "); Serial.println(speedDevicePresent ? "PRESENT" : "absent");
   Serial.print("  CAN spd:"); Serial.println(canSpeedKmh100);
   #endif
   Serial.print("  TX ok:  "); Serial.println(txOk);
@@ -513,15 +526,20 @@ void check_buttons() {
 
     if (cruiseEngaged && !prevCruiseEngaged) {
       // SET moment: capture current speed
-      #if EXTERNAL_SPEED_DEVICE
-        cruiseSetSpeed = (uint8_t)(canSpeedKmh100 / 100);
-      #elif SPEED_SOURCE == 2
-        cruiseSetSpeed = (uint8_t)(vssSpeedKmh100 / 100);
-      #elif SPEED_SOURCE == 1
-        cruiseSetSpeed = (uint8_t)((uint32_t)analogRead(SPEED_POT_PIN) * 120 / 1023);
-      #else
-        cruiseSetSpeed = (uint8_t)(serialSpeedKmh100 / 100);
+      #if AUTO_DETECT_SPEED_DEVICE
+        if (speedDevicePresent) {
+          cruiseSetSpeed = (uint8_t)(canSpeedKmh100 / 100);
+        } else
       #endif
+      {
+        #if SPEED_SOURCE == 2
+          cruiseSetSpeed = (uint8_t)(vssSpeedKmh100 / 100);
+        #elif SPEED_SOURCE == 1
+          cruiseSetSpeed = (uint8_t)((uint32_t)analogRead(SPEED_POT_PIN) * 120 / 1023);
+        #else
+          cruiseSetSpeed = (uint8_t)(serialSpeedKmh100 / 100);
+        #endif
+      }
       Serial.print("Cruise: ENGAGED at ");
       Serial.print(cruiseSetSpeed);
       Serial.println(" km/h");
@@ -586,7 +604,7 @@ void setup() {
   Serial.print("REAL_EPS_CONNECTED:   "); Serial.println(REAL_EPS_CONNECTED ? "true" : "false");
   Serial.print("REAL_SAS_CONNECTED:   "); Serial.println(REAL_SAS_CONNECTED ? "true" : "false");
   Serial.print("REAL_PEDAL_CONNECTED: "); Serial.println(REAL_PEDAL_CONNECTED ? "true" : "false");
-  Serial.print("EXTERNAL_SPEED_DEVICE:"); Serial.println(EXTERNAL_SPEED_DEVICE ? "true (0xAA/0xB4 from CAN)" : "false");
+  Serial.print("AUTO_DETECT_SPEED:    "); Serial.println(AUTO_DETECT_SPEED_DEVICE ? "true (listen for 0xAA)" : "false");
   Serial.print("SEND_ACC_CONTROL:     "); Serial.println(SEND_ACC_CONTROL ? "true (WARNING!)" : "false");
   Serial.println("--------------");
 }
@@ -633,7 +651,11 @@ void loop() {
     lastMicros_83hz = now;
 
     #if SEND_WHEEL_SPEEDS
-      send_wheel_speeds(spd);
+      #if AUTO_DETECT_SPEED_DEVICE
+        if (!speedDevicePresent) send_wheel_speeds(spd);
+      #else
+        send_wheel_speeds(spd);
+      #endif
     #endif
 
     #if !REAL_SAS_CONNECTED
@@ -655,7 +677,11 @@ void loop() {
     #endif
 
     #if SEND_SPEED
-      send_speed(spd);
+      #if AUTO_DETECT_SPEED_DEVICE
+        if (!speedDevicePresent) send_speed(spd);
+      #else
+        send_speed(spd);
+      #endif
     #endif
 
     #if SEND_ENGINE_RPM
@@ -733,8 +759,8 @@ void loop() {
     #endif
   }
 
-  // --- CAN receive: read speed from external VSS device ---
-  #if EXTERNAL_SPEED_DEVICE
+  // --- CAN receive: auto-detect external VSS device ---
+  #if AUTO_DETECT_SPEED_DEVICE
     check_can_speed();
   #endif
 
