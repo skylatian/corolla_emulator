@@ -46,6 +46,13 @@ MCP_CAN CAN(9);  // Seeed CAN Bus Shield v2: CS on D9 (not D10)
 #define AUTO_DETECT_SPEED_DEVICE  true // you should only use this for debugging on the bench! should be set to false for use in car
 #define SPEED_DEVICE_TIMEOUT_MS   1000  // 1 second without 0xAA = device gone
 
+// External cruise stalk device auto-detection.
+// When true, the emulator listens for 0x69 on the CAN bus. If received within
+// timeout, stalk CAN input drives the cruise state machine instead of digital buttons.
+// When false (or device absent), digital buttons on pins 3/4 control cruise.
+#define AUTO_DETECT_STALK_DEVICE  true
+#define STALK_DEVICE_TIMEOUT_MS   1000  // 1 second without 0x69 = device gone
+
 // Send the bulk "background" messages from the original emulator (0x367, 0x394, etc.)
 // These fill out the CAN bus to look more like a real car. Required for OP to fingerprint the car, at least in its current state
 #define SEND_BACKGROUND_MSGS  true
@@ -103,9 +110,15 @@ unsigned long lastMillis_hb   = 0;  // heartbeat
 // STATE
 // ============================================================================
 
-bool cruiseEngaged = false;    // CRUISE_ACTIVE in 0x1D2
-bool prevCruiseEngaged = false; // Previous state for edge detection
-bool cruiseMain = true;        // MAIN_ON in 0x1D3 (default on)
+// Cruise state machine
+#define CRUISE_OFF        0  // MAIN off, no cruise
+#define CRUISE_MAIN_ON    1  // MAIN on, cruise not engaged
+#define CRUISE_ENGAGED    2  // Cruise actively controlling speed
+#define CRUISE_CANCELLED  3  // Cruise cancelled, speed preserved for resume
+
+uint8_t cruiseState = CRUISE_MAIN_ON;  // Start with MAIN on (matches old default)
+bool cruiseEngaged = false;    // CRUISE_ACTIVE in 0x1D2 (derived from state)
+bool cruiseMain = true;        // MAIN_ON in 0x1D3 (derived from state)
 bool gearInDrive = true;       // true = Drive, false = Park
 uint8_t cruiseSetSpeed = 0;    // Captured speed at SET moment (km/h)
 uint8_t msg_counter_1d2 = 0;  // Counter for 0x1D2 (used in checksum rotation)
@@ -144,12 +157,29 @@ void vssISR() {
 uint16_t canSpeedKmh100 = 0;       // speed in km/h * 100, read from 0xAA on bus
 unsigned long lastCanSpeedMs = 0;   // millis() of last 0xAA received
 bool speedDevicePresent = false;    // true when 0xAA seen within timeout
+#endif
+
+// CAN-received stalk input from external cruise stalk device (auto-detect)
+#if AUTO_DETECT_STALK_DEVICE
+// Stalk button event codes (must match cruise_stalk.ino)
+#define STALK_BTN_NONE         0
+#define STALK_BTN_SET          1
+#define STALK_BTN_RES          2
+#define STALK_BTN_CANCEL       3
+#define STALK_BTN_MAIN_TOGGLE  4
+
+uint8_t stalkButtonEvent = STALK_BTN_NONE;  // Latest button event from stalk
+bool stalkMainOn = false;                    // MAIN state from stalk device
+unsigned long lastStalkMs = 0;               // millis() of last 0x69 received
+bool stalkDevicePresent = false;             // true when 0x69 seen within timeout
+#endif
 
 // Read incoming CAN messages. Non-blocking — only reads if a message is in the
-// MCP2515 RX buffer. Extracts speed from 0xAA (WHEEL_SPEEDS) and drains other
-// messages to prevent the RX buffer from filling up.
-// Also tracks whether the external device is alive (timeout-based).
-void check_can_speed() {
+// MCP2515 RX buffer. Handles:
+//   0xAA (WHEEL_SPEEDS) from external VSS device
+//   0x69 (CRUISE_STALK) from external stalk device
+// Drains other messages to prevent the RX buffer from filling up.
+void check_can_receive() {
   unsigned long nowMs = millis();
 
   if (CAN.checkReceive() == CAN_MSGAVAIL) {
@@ -158,6 +188,7 @@ void check_can_speed() {
     uint8_t rxBuf[8];
     CAN.readMsgBuf(&rxId, &rxLen, rxBuf);
 
+    #if AUTO_DETECT_SPEED_DEVICE
     if (rxId == 0xAA && rxLen >= 2) {
       uint16_t raw = ((uint16_t)rxBuf[0] << 8) | rxBuf[1];
       canSpeedKmh100 = (raw >= 6767) ? (raw - 6767) : 0;
@@ -168,16 +199,41 @@ void check_can_speed() {
         Serial.println(F("VSS device DETECTED — using CAN speed"));
       }
     }
+    #endif
+
+    #if AUTO_DETECT_STALK_DEVICE
+    if (rxId == 0x69 && rxLen >= 2) {
+      if (rxBuf[0] != STALK_BTN_NONE) {
+        stalkButtonEvent = rxBuf[0];  // Latch non-NONE events
+      }
+      stalkMainOn = (rxBuf[1] != 0);
+      lastStalkMs = nowMs;
+
+      if (!stalkDevicePresent) {
+        stalkDevicePresent = true;
+        Serial.println(F("Stalk device DETECTED — using CAN stalk input"));
+      }
+    }
+    #endif
   }
 
-  // Timeout: if no 0xAA received for SPEED_DEVICE_TIMEOUT_MS, device is gone
+  // Timeouts
+  #if AUTO_DETECT_SPEED_DEVICE
   if (speedDevicePresent && (nowMs - lastCanSpeedMs) >= SPEED_DEVICE_TIMEOUT_MS) {
     speedDevicePresent = false;
     canSpeedKmh100 = 0;
     Serial.println(F("VSS device LOST — falling back to local speed"));
   }
+  #endif
+
+  #if AUTO_DETECT_STALK_DEVICE
+  if (stalkDevicePresent && (nowMs - lastStalkMs) >= STALK_DEVICE_TIMEOUT_MS) {
+    stalkDevicePresent = false;
+    stalkButtonEvent = STALK_BTN_NONE;
+    Serial.println(F("Stalk device LOST — falling back to digital buttons"));
+  }
+  #endif
 }
-#endif
 
 // ============================================================================
 // TOYOTA CHECKSUM
@@ -229,7 +285,9 @@ void print_heartbeat() {
     uint16_t spd = serialSpeedKmh100;
   #endif
 
+  static const char* stateNames[] = {"OFF", "MAIN_ON", "ENGAGED", "CANCELLED"};
   Serial.println("--- Status ---");
+  Serial.print("  State:  "); Serial.println(stateNames[cruiseState]);
   Serial.print("  Cruise: "); Serial.println(cruiseEngaged ? "ENGAGED" : "off");
   Serial.print("  Main:   "); Serial.println(cruiseMain    ? "ON"       : "off");
   Serial.print("  Gear:   "); Serial.println(gearInDrive   ? "Drive"    : "Park");
@@ -238,6 +296,9 @@ void print_heartbeat() {
   #if AUTO_DETECT_SPEED_DEVICE
   Serial.print("  VSSdev: "); Serial.println(speedDevicePresent ? "PRESENT" : "absent");
   Serial.print("  CAN spd:"); Serial.println(canSpeedKmh100);
+  #endif
+  #if AUTO_DETECT_STALK_DEVICE
+  Serial.print("  Stalk:  "); Serial.println(stalkDevicePresent ? "PRESENT" : "absent");
   #endif
   Serial.print("  TX ok:  "); Serial.println(txOk);
   Serial.print("  TX err: "); Serial.println(txError);
@@ -512,52 +573,148 @@ void check_serial() {
 }
 
 // ============================================================================
+// CRUISE STATE MACHINE
+// ============================================================================
+
+// Get current speed in km/h (integer) from the best available source
+uint8_t get_current_speed_kmh() {
+  #if AUTO_DETECT_SPEED_DEVICE
+    if (speedDevicePresent) {
+      return (uint8_t)(canSpeedKmh100 / 100);
+    }
+  #endif
+  #if SPEED_SOURCE == 2
+    return (uint8_t)(vssSpeedKmh100 / 100);
+  #elif SPEED_SOURCE == 1
+    return (uint8_t)((uint32_t)analogRead(SPEED_POT_PIN) * 120 / 1023);
+  #else
+    return (uint8_t)(serialSpeedKmh100 / 100);
+  #endif
+}
+
+// Update derived outputs from cruise state
+void update_cruise_outputs() {
+  cruiseMain = (cruiseState != CRUISE_OFF);
+  cruiseEngaged = (cruiseState == CRUISE_ENGAGED);
+}
+
+// Process a cruise button event through the state machine.
+// event: 1=SET, 2=RES, 3=CANCEL, 4=MAIN_TOGGLE
+// main_on: current MAIN state (from stalk device or internal toggle)
+void process_cruise_event(uint8_t event, bool main_on) {
+  // MAIN_TOGGLE: transition based on main_on state
+  if (event == 4) {  // MAIN_TOGGLE
+    if (main_on) {
+      // MAIN just turned ON
+      if (cruiseState == CRUISE_OFF) {
+        cruiseState = CRUISE_MAIN_ON;
+        Serial.println(F("Cruise: MAIN ON"));
+      }
+    } else {
+      // MAIN just turned OFF — full reset
+      cruiseState = CRUISE_OFF;
+      cruiseSetSpeed = 0;
+      Serial.println(F("Cruise: MAIN OFF — full reset"));
+    }
+    update_cruise_outputs();
+    return;
+  }
+
+  // All other events require MAIN to be on
+  if (cruiseState == CRUISE_OFF) return;
+
+  switch (event) {
+    case 1:  // SET
+      if (cruiseState == CRUISE_MAIN_ON || cruiseState == CRUISE_CANCELLED) {
+        // First engagement: capture current speed
+        cruiseSetSpeed = get_current_speed_kmh();
+        cruiseState = CRUISE_ENGAGED;
+        Serial.print(F("Cruise: SET — engaged at "));
+        Serial.print(cruiseSetSpeed);
+        Serial.println(F(" km/h"));
+      } else if (cruiseState == CRUISE_ENGAGED) {
+        // Decrement set speed (clamp to 1, never 0 while engaged)
+        if (cruiseSetSpeed > 1) cruiseSetSpeed--;
+        Serial.print(F("Cruise: SET- → "));
+        Serial.print(cruiseSetSpeed);
+        Serial.println(F(" km/h"));
+      }
+      break;
+
+    case 2:  // RES
+      if (cruiseState == CRUISE_CANCELLED) {
+        // Resume: re-engage with preserved speed
+        cruiseState = CRUISE_ENGAGED;
+        Serial.print(F("Cruise: RESUME at "));
+        Serial.print(cruiseSetSpeed);
+        Serial.println(F(" km/h"));
+      } else if (cruiseState == CRUISE_ENGAGED) {
+        // Increment set speed (clamp to 255)
+        if (cruiseSetSpeed < 255) cruiseSetSpeed++;
+        Serial.print(F("Cruise: RES+ → "));
+        Serial.print(cruiseSetSpeed);
+        Serial.println(F(" km/h"));
+      }
+      break;
+
+    case 3:  // CANCEL
+      if (cruiseState == CRUISE_ENGAGED) {
+        cruiseState = CRUISE_CANCELLED;
+        Serial.print(F("Cruise: CANCELLED (speed preserved: "));
+        Serial.print(cruiseSetSpeed);
+        Serial.println(F(" km/h)"));
+      }
+      break;
+  }
+
+  update_cruise_outputs();
+}
+
+// ============================================================================
 // BUTTON HANDLING
 // ============================================================================
 
 void check_buttons() {
   unsigned long now = millis();
 
-  // Cruise engage/disengage toggle
-  if (digitalRead(CRUISE_BUTTON_PIN) == HIGH && (now - lastDebounce_cruise) > DEBOUNCE_MS) {
-    lastDebounce_cruise = now;
-    prevCruiseEngaged = cruiseEngaged;
-    cruiseEngaged = !cruiseEngaged;
+  #if AUTO_DETECT_STALK_DEVICE
+  // --- CAN stalk input (priority when stalk device is present) ---
+  if (stalkDevicePresent && stalkButtonEvent != STALK_BTN_NONE) {
+    process_cruise_event(stalkButtonEvent, stalkMainOn);
+    stalkButtonEvent = STALK_BTN_NONE;  // Consume the event
+  }
+  #endif
 
-    if (cruiseEngaged && !prevCruiseEngaged) {
-      // SET moment: capture current speed
-      #if AUTO_DETECT_SPEED_DEVICE
-        if (speedDevicePresent) {
-          cruiseSetSpeed = (uint8_t)(canSpeedKmh100 / 100);
-        } else
-      #endif
-      {
-        #if SPEED_SOURCE == 2
-          cruiseSetSpeed = (uint8_t)(vssSpeedKmh100 / 100);
-        #elif SPEED_SOURCE == 1
-          cruiseSetSpeed = (uint8_t)((uint32_t)analogRead(SPEED_POT_PIN) * 120 / 1023);
-        #else
-          cruiseSetSpeed = (uint8_t)(serialSpeedKmh100 / 100);
-        #endif
+  // --- Digital button fallback (when no stalk device) ---
+  #if AUTO_DETECT_STALK_DEVICE
+  if (!stalkDevicePresent) {
+  #endif
+
+    // Cruise button: SET (if not engaged) or CANCEL (if engaged)
+    if (digitalRead(CRUISE_BUTTON_PIN) == HIGH && (now - lastDebounce_cruise) > DEBOUNCE_MS) {
+      lastDebounce_cruise = now;
+      if (cruiseState == CRUISE_ENGAGED) {
+        // CANCEL
+        process_cruise_event(3, cruiseMain);
+      } else {
+        // SET
+        process_cruise_event(1, cruiseMain);
       }
-      Serial.print("Cruise: ENGAGED at ");
-      Serial.print(cruiseSetSpeed);
-      Serial.println(" km/h");
-    } else {
-      cruiseSetSpeed = 0;
-      Serial.println("Cruise: disengaged");
     }
-  }
 
-  // Main on/off toggle
-  if (digitalRead(MAIN_BUTTON_PIN) == HIGH && (now - lastDebounce_main) > DEBOUNCE_MS) {
-    lastDebounce_main = now;
-    cruiseMain = !cruiseMain;
-    Serial.print("Main: ");
-    Serial.println(cruiseMain ? "ON" : "off");
-  }
+    // Main on/off toggle
+    if (digitalRead(MAIN_BUTTON_PIN) == HIGH && (now - lastDebounce_main) > DEBOUNCE_MS) {
+      lastDebounce_main = now;
+      // Toggle: if MAIN is on (any state except OFF), turn OFF. Otherwise turn ON.
+      bool newMain = (cruiseState == CRUISE_OFF);
+      process_cruise_event(4, newMain);
+    }
 
-  // Gear toggle
+  #if AUTO_DETECT_STALK_DEVICE
+  }
+  #endif
+
+  // Gear toggle (always from digital button)
   if (digitalRead(GEAR_BUTTON_PIN) == HIGH && (now - lastDebounce_gear) > DEBOUNCE_MS) {
     lastDebounce_gear = now;
     gearInDrive = !gearInDrive;
@@ -605,6 +762,7 @@ void setup() {
   Serial.print("REAL_SAS_CONNECTED:   "); Serial.println(REAL_SAS_CONNECTED ? "true" : "false");
   Serial.print("REAL_PEDAL_CONNECTED: "); Serial.println(REAL_PEDAL_CONNECTED ? "true" : "false");
   Serial.print("AUTO_DETECT_SPEED:    "); Serial.println(AUTO_DETECT_SPEED_DEVICE ? "true (listen for 0xAA)" : "false");
+  Serial.print("AUTO_DETECT_STALK:    "); Serial.println(AUTO_DETECT_STALK_DEVICE ? "true (listen for 0x69)" : "false");
   Serial.print("SEND_ACC_CONTROL:     "); Serial.println(SEND_ACC_CONTROL ? "true (WARNING!)" : "false");
   Serial.println("--------------");
 }
@@ -759,10 +917,8 @@ void loop() {
     #endif
   }
 
-  // --- CAN receive: auto-detect external VSS device ---
-  #if AUTO_DETECT_SPEED_DEVICE
-    check_can_speed();
-  #endif
+  // --- CAN receive: auto-detect external devices (VSS speed, cruise stalk) ---
+  check_can_receive();
 
   // --- Serial speed input + button handling ---
   check_serial();
