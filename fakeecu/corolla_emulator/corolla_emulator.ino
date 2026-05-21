@@ -47,7 +47,7 @@ MCP_CAN CAN(9);  // Seeed CAN Bus Shield v2: CS on D9 (not D10)
 #define SPEED_DEVICE_TIMEOUT_MS   1000  // 1 second without 0xAA = device gone
 
 // Send the bulk "background" messages from the original emulator (0x367, 0x394, etc.)
-// These fill out the CAN bus to look more like a real car. Not strictly required.
+// These fill out the CAN bus to look more like a real car. Required for OP to fingerprint the car, at least in its current state
 #define SEND_BACKGROUND_MSGS  true
 
 // ============================================================================
