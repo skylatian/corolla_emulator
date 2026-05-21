@@ -61,9 +61,11 @@ MCP_CAN CAN(9);  // Seeed CAN Bus Shield v2: CS on D9 (not D10)
 // PIN ASSIGNMENTS
 // ============================================================================
 
-#define CRUISE_BUTTON_PIN  3   // SET (engage/decrement) or CANCEL (disengage) — fallback when no stalk device
-#define MAIN_BUTTON_PIN    4   // Toggle MAIN on/off — fallback when no stalk device
-#define GEAR_BUTTON_PIN    5   // Toggle gear: Drive <-> Park (0x3BC)
+#define SET_BUTTON_PIN     3   // SET: engage cruise / decrement set speed
+#define RES_BUTTON_PIN     4   // RES: resume cruise / increment set speed
+#define CANCEL_BUTTON_PIN  5   // CANCEL: disengage cruise (set speed preserved)
+#define MAIN_BUTTON_PIN    6   // MAIN: toggle cruise main on/off
+#define GEAR_BUTTON_PIN    8   // Toggle gear: Drive <-> Park
 #define SPEED_POT_PIN      A0  // Potentiometer for wheel/vehicle speed (SPEED_SOURCE 1)
 
 // Speed source: 0 = serial (type mph + enter), 1 = analog pot, 2 = VSS pulse counter
@@ -125,7 +127,9 @@ uint8_t msg_counter_1d2 = 0;  // Unused — kept for future rolling counter if n
 uint8_t msg_counter_201 = 0;  // Counter for 0x201 (GAS_SENSOR, 4-bit rolling)
 
 // Button debounce
-unsigned long lastDebounce_cruise = 0;
+unsigned long lastDebounce_set    = 0;
+unsigned long lastDebounce_res    = 0;
+unsigned long lastDebounce_cancel = 0;
 unsigned long lastDebounce_main   = 0;
 unsigned long lastDebounce_gear   = 0;
 #define DEBOUNCE_MS 300
@@ -746,24 +750,29 @@ void check_buttons() {
   if (!stalkDevicePresent) {
   #endif
 
-    // Cruise button: SET (if not engaged) or CANCEL (if engaged)
-    if (digitalRead(CRUISE_BUTTON_PIN) == HIGH && (now - lastDebounce_cruise) > DEBOUNCE_MS) {
-      lastDebounce_cruise = now;
-      if (cruiseState == CRUISE_ENGAGED) {
-        // CANCEL
-        process_cruise_event(3, cruiseMain);
-      } else {
-        // SET
-        process_cruise_event(1, cruiseMain);
-      }
+    // SET button
+    if (digitalRead(SET_BUTTON_PIN) == HIGH && (now - lastDebounce_set) > DEBOUNCE_MS) {
+      lastDebounce_set = now;
+      process_cruise_event(STALK_BTN_SET, cruiseMain);
     }
 
-    // Main on/off toggle
+    // RES button
+    if (digitalRead(RES_BUTTON_PIN) == HIGH && (now - lastDebounce_res) > DEBOUNCE_MS) {
+      lastDebounce_res = now;
+      process_cruise_event(STALK_BTN_RES, cruiseMain);
+    }
+
+    // CANCEL button
+    if (digitalRead(CANCEL_BUTTON_PIN) == HIGH && (now - lastDebounce_cancel) > DEBOUNCE_MS) {
+      lastDebounce_cancel = now;
+      process_cruise_event(STALK_BTN_CANCEL, cruiseMain);
+    }
+
+    // MAIN toggle
     if (digitalRead(MAIN_BUTTON_PIN) == HIGH && (now - lastDebounce_main) > DEBOUNCE_MS) {
       lastDebounce_main = now;
-      // Toggle: if MAIN is on (any state except OFF), turn OFF. Otherwise turn ON.
       bool newMain = (cruiseState == CRUISE_OFF);
-      process_cruise_event(4, newMain);
+      process_cruise_event(STALK_BTN_MAIN_TOGGLE, newMain);
     }
 
   #if AUTO_DETECT_STALK_DEVICE
@@ -789,7 +798,9 @@ void setup() {
   Serial.println("Corolla CAN Emulator starting...");
 
   // Button pins
-  pinMode(CRUISE_BUTTON_PIN, INPUT);
+  pinMode(SET_BUTTON_PIN, INPUT);
+  pinMode(RES_BUTTON_PIN, INPUT);
+  pinMode(CANCEL_BUTTON_PIN, INPUT);
   pinMode(MAIN_BUTTON_PIN, INPUT);
   pinMode(GEAR_BUTTON_PIN, INPUT);
 

@@ -72,9 +72,11 @@ When no stalk device is detected, physical buttons on the emulator work:
 
 | Pin | Function |
 |-----|----------|
-| D3 | SET (if not engaged) or CANCEL (if engaged) |
-| D4 | MAIN on/off toggle |
-| D5 | Gear: Drive ↔ Park |
+| D3 | SET: engage cruise / decrement set speed |
+| D4 | RES: resume cruise / increment set speed |
+| D5 | CANCEL: disengage cruise (set speed preserved) |
+| D6 | MAIN: toggle cruise on/off |
+| D8 | Gear: Drive ↔ Park |
 
 ## Speed Sources
 
