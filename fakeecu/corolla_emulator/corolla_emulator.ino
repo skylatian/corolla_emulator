@@ -61,8 +61,8 @@ MCP_CAN CAN(9);  // Seeed CAN Bus Shield v2: CS on D9 (not D10)
 // PIN ASSIGNMENTS
 // ============================================================================
 
-#define CRUISE_BUTTON_PIN  3   // Toggle cruise engaged (0x1D2 CRUISE_ACTIVE)
-#define MAIN_BUTTON_PIN    4   // Toggle cruise main on (0x1D3 MAIN_ON) — not used if SEND_PCM_CRUISE_2 is hardcoded on
+#define CRUISE_BUTTON_PIN  3   // SET (engage/decrement) or CANCEL (disengage) — fallback when no stalk device
+#define MAIN_BUTTON_PIN    4   // Toggle MAIN on/off — fallback when no stalk device
 #define GEAR_BUTTON_PIN    5   // Toggle gear: Drive <-> Park (0x3BC)
 #define SPEED_POT_PIN      A0  // Potentiometer for wheel/vehicle speed (SPEED_SOURCE 1)
 
@@ -121,7 +121,7 @@ bool cruiseEngaged = false;    // CRUISE_ACTIVE in 0x1D2 (derived from state)
 bool cruiseMain = true;        // MAIN_ON in 0x1D3 (derived from state)
 bool gearInDrive = true;       // true = Drive, false = Park
 uint8_t cruiseSetSpeed = 0;    // Captured speed at SET moment (km/h)
-uint8_t msg_counter_1d2 = 0;  // Counter for 0x1D2 (used in checksum rotation)
+uint8_t msg_counter_1d2 = 0;  // Unused — kept for future rolling counter if needed
 uint8_t msg_counter_201 = 0;  // Counter for 0x201 (GAS_SENSOR, 4-bit rolling)
 
 // Button debounce
@@ -663,7 +663,7 @@ void process_cruise_event(uint8_t event, bool main_on) {
   switch (event) {
     case 1:  // SET
       if (cruiseState == CRUISE_MAIN_ON || cruiseState == CRUISE_CANCELLED) {
-        // First engagement: capture current speed
+        // Engage: capture current speed as new set speed
         cruiseSetSpeed = get_current_speed_kmh();
         cruiseState = CRUISE_ENGAGED;
         Serial.print(F("Cruise: SET — engaged at "));
