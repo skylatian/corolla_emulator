@@ -29,8 +29,8 @@ MCP_CAN CAN(9);  // Seeed CAN Bus Shield v2: CS on D9 (not D10)
 #define SEND_PCM_CRUISE_2     true   // 0x1D3 — MAIN_ON flag (cruise availability)
 #define SEND_GEAR_PACKET      true   // 0x3BC — gear position
 #define SEND_BODY_CONTROL     true   // 0x620 — doors/seatbelt state
-#define SEND_WHEEL_SPEEDS     true   // 0xAA  — required by panda safety RX checks (83 Hz)
-#define SEND_SPEED            true   // 0xB4  — vehicle speed (also EPS init message)
+#define SEND_WHEEL_SPEEDS     false   // 0xAA  — required by panda safety RX checks (83 Hz)
+#define SEND_SPEED            false   // 0xB4  — vehicle speed (also EPS init message)
 #define SEND_PCM_CRUISE       true   // 0x1D2 — cruise state (required by panda safety)
 #define SEND_ENGINE_RPM       true   // 0x1C4 — EPS init message (42 Hz required by carstate)
 #define SEND_EPS_INIT_4CB     true   // 0x4CB — EPS init message

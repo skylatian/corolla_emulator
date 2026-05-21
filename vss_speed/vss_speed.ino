@@ -2,9 +2,12 @@
 // VSS Speed Device — Standalone CAN Speed Sender
 // Reads Vehicle Speed Sensor (VSS) pulses and broadcasts speed on CAN bus.
 //
-// Hardware: Pro Micro (ATmega32U4) + MCP2515 breakout board (16MHz crystal)
-// Wiring:  MCP2515 CS=D10, SI=D11, SO=D12, SCK=D13, INT=D2 (unused)
-//          VSS signal → D7 (hardware interrupt capable on ATmega32U4)
+// Hardware: Longan CANBed V1 (ATmega32U4, Leonardo bootloader, 16MHz)
+//           Onboard MCP2515 CAN controller, CS=D17
+//           VSS signal → D7 (hardware interrupt capable on ATmega32U4)
+//
+// Library:  Longan Labs Arduino_CAN_BUS_MCP2515
+//           https://github.com/Longan-Labs/Aruino_CAN_BUS_MCP2515
 //
 // Sends:
 //   0xAA WHEEL_SPEEDS  at 83 Hz — 4 identical 16-bit BE wheel speeds
@@ -15,16 +18,16 @@
 // ============================================================================
 
 #include <SPI.h>
-#include <mcp_can.h>
+#include <mcp_can.h>  // Longan Labs MCP2515 library
 
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
 
-#define VSS_PIN            7     // VSS signal input (must support hardware interrupt)
+#define VSS_PIN            3     // VSS signal input (must support hardware interrupt)
 #define VSS_PULSES_PER_KM  3098  // Calibration: pulses per kilometer (measure empirically)
 #define VSS_SAMPLE_MS      500   // Sampling window in ms
-#define CAN_CS_PIN         10    // MCP2515 chip select (breakout board default)
+#define CAN_CS_PIN         17    // CANBed V1 onboard MCP2515 CS pin
 
 // ============================================================================
 // TIMING
@@ -118,7 +121,6 @@ void send_speed(uint16_t spd_kmh_x100) {
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial);  // Pro Micro needs this for USB serial
   Serial.println(F("VSS Speed Device starting..."));
 
   // VSS input
@@ -129,7 +131,7 @@ void setup() {
   Serial.print(F("Pulses/km: "));
   Serial.println(VSS_PULSES_PER_KM);
 
-  // Init MCP2515
+  // Init onboard MCP2515
   while (CAN.begin(MCP_ANY, CAN_500KBPS, MCP_16MHZ) != CAN_OK) {
     Serial.println(F("CAN init failed, retrying..."));
     delay(500);
