@@ -56,12 +56,13 @@ CAN messages affected:
 
 ## Cruise Stalk Protocol (0x69)
 
-2 bytes at 20 Hz from the stalk device:
+3 bytes at 20 Hz from the stalk device:
 
 | Byte | Field | Values |
 |------|-------|--------|
 | 0 | Button event | 0=NONE, 1=SET, 2=RES, 3=CANCEL, 4=MAIN_TOGGLE |
 | 1 | MAIN state | 0=OFF, 1=ON (toggle tracked on stalk device) |
+| 2 | Checksum | `toyota_checksum(0x69, data, 3)` — emulator rejects frames that fail |
 
 Button events are pulse-style: non-NONE for one frame, then NONE. MAIN state (byte 1) is sent on every frame, allowing the emulator to recover from lost event frames.
 

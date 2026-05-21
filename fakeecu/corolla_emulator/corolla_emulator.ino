@@ -205,7 +205,10 @@ void check_can_receive() {
     #endif
 
     #if AUTO_DETECT_STALK_DEVICE
-    if (rxId == 0x69 && rxLen >= 2) {
+    if (rxId == 0x69 && rxLen >= 3) {
+      // Validate toyota_checksum (byte 2) — reject corrupted frames
+      if (rxBuf[2] != toyota_checksum(0x69, rxBuf, 3)) continue;
+
       // Validate event code (0-4 are valid, reject garbage)
       uint8_t evt = rxBuf[0];
       if (evt != STALK_BTN_NONE && evt <= STALK_BTN_MAIN_TOGGLE) {
