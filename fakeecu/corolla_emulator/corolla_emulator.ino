@@ -37,6 +37,11 @@ MCP_CAN CAN(9);  // Seeed CAN Bus Shield v2: CS on D9 (not D10)
 #define SEND_PRE_COLLISION    true   // 0x283 — required by carstate for non-TSS2 without DSU
 #define SEND_VSC1S07          true   // 0x320 — vehicle stability control (20 Hz required)
 
+// External VSS speed device: when true, a separate Pro Micro + MCP2515 device
+// sends 0xAA (WHEEL_SPEEDS) and 0xB4 (SPEED) from the real VSS sensor.
+// The emulator reads speed from CAN (0xAA) instead of sending it.
+#define EXTERNAL_SPEED_DEVICE true
+
 // Send the bulk "background" messages from the original emulator (0x367, 0x394, etc.)
 // These fill out the CAN bus to look more like a real car. Not strictly required.
 #define SEND_BACKGROUND_MSGS  true
@@ -48,8 +53,30 @@ MCP_CAN CAN(9);  // Seeed CAN Bus Shield v2: CS on D9 (not D10)
 #define CRUISE_BUTTON_PIN  3   // Toggle cruise engaged (0x1D2 CRUISE_ACTIVE)
 #define MAIN_BUTTON_PIN    4   // Toggle cruise main on (0x1D3 MAIN_ON) — not used if SEND_PCM_CRUISE_2 is hardcoded on
 #define GEAR_BUTTON_PIN    5   // Toggle gear: Drive <-> Park (0x3BC)
-#define SPEED_POT_PIN      A0  // Potentiometer for wheel/vehicle speed
-#define USE_SPEED_POT      false // true = analog pot, false = serial input (type mph + enter)
+#define SPEED_POT_PIN      A0  // Potentiometer for wheel/vehicle speed (SPEED_SOURCE 1)
+
+// When EXTERNAL_SPEED_DEVICE is true, force off local speed message sending
+#if EXTERNAL_SPEED_DEVICE
+  #undef SEND_WHEEL_SPEEDS
+  #define SEND_WHEEL_SPEEDS false
+  #undef SEND_SPEED
+  #define SEND_SPEED false
+#endif
+
+// Speed source: 0 = serial (type mph + enter), 1 = analog pot, 2 = VSS pulse counter
+#define SPEED_SOURCE       0
+
+// VSS (Vehicle Speed Sensor) configuration — only used when SPEED_SOURCE == 2
+// Wire VSS signal to this pin (must support hardware interrupts).
+// Pin 7 works on Pro Micro (ATmega32U4). On Uno, use pin 2 or 3.
+#define VSS_PIN            7
+// Calibration: pulses per kilometer. Measured empirically — do NOT calculate from gear ratios.
+// Baseline: ~13.85 pulses/sec at 10 mph (16.09 km/h) → ~3098 pulses/km
+// Refine by measuring at multiple speeds over longer distances.
+#define VSS_PULSES_PER_KM  3098
+// Sampling window in ms. Longer = smoother but more latency.
+// 500ms gives ~3.5 pulses at 5 mph (acceptable) and ~7 at 10 mph (good).
+#define VSS_SAMPLE_MS      500
 
 // ============================================================================
 // TIMING (micros-based, non-blocking)
@@ -81,8 +108,10 @@ unsigned long lastMillis_hb   = 0;  // heartbeat
 // ============================================================================
 
 bool cruiseEngaged = false;    // CRUISE_ACTIVE in 0x1D2
+bool prevCruiseEngaged = false; // Previous state for edge detection
 bool cruiseMain = true;        // MAIN_ON in 0x1D3 (default on)
 bool gearInDrive = true;       // true = Drive, false = Park
+uint8_t cruiseSetSpeed = 0;    // Captured speed at SET moment (km/h)
 uint8_t msg_counter_1d2 = 0;  // Counter for 0x1D2 (used in checksum rotation)
 uint8_t msg_counter_201 = 0;  // Counter for 0x201 (GAS_SENSOR, 4-bit rolling)
 
@@ -96,11 +125,47 @@ unsigned long lastDebounce_gear   = 0;
 uint32_t txOk    = 0;
 uint32_t txError = 0;
 
-// Serial-controlled speed (when USE_SPEED_POT is false)
+// Serial-controlled speed (SPEED_SOURCE 0)
 // Type a number in mph into the serial monitor and hit enter
 uint16_t serialSpeedKmh100 = 0;
 char serialBuf[16];
 uint8_t serialBufIdx = 0;
+
+// VSS pulse counting (SPEED_SOURCE 2)
+#if SPEED_SOURCE == 2
+volatile unsigned long vssPulseCount = 0;
+unsigned long vssLastSampleMs = 0;
+unsigned long vssLastCount = 0;
+uint16_t vssSpeedKmh100 = 0;  // speed in km/h * 100
+
+void vssISR() {
+  vssPulseCount++;
+}
+#endif
+
+// CAN-received speed from external VSS device (EXTERNAL_SPEED_DEVICE)
+#if EXTERNAL_SPEED_DEVICE
+uint16_t canSpeedKmh100 = 0;  // speed in km/h * 100, read from 0xAA on bus
+
+// Read incoming CAN messages. Non-blocking — only reads if a message is in the
+// MCP2515 RX buffer. Extracts speed from 0xAA (WHEEL_SPEEDS) and drains other
+// messages to prevent the RX buffer from filling up.
+void check_can_speed() {
+  if (CAN.checkReceive() == CAN_MSGAVAIL) {
+    unsigned long rxId;
+    uint8_t rxLen;
+    uint8_t rxBuf[8];
+    CAN.readMsgBuf(&rxId, &rxLen, rxBuf);
+
+    if (rxId == 0xAA && rxLen >= 2) {
+      // First wheel speed: bytes 0-1, 16-bit BE, offset +6767
+      uint16_t raw = ((uint16_t)rxBuf[0] << 8) | rxBuf[1];
+      canSpeedKmh100 = (raw >= 6767) ? (raw - 6767) : 0;
+    }
+    // Other CAN IDs are silently discarded (buffer drain)
+  }
+}
+#endif
 
 // ============================================================================
 // TOYOTA CHECKSUM
@@ -144,10 +209,12 @@ void print_heartbeat() {
   if (now - lastMillis_hb < HEARTBEAT_MS) return;
   lastMillis_hb = now;
 
-  #if USE_SPEED_POT
+  #if SPEED_SOURCE == 1
     uint16_t spd = analogRead(SPEED_POT_PIN) * 18;
+  #elif SPEED_SOURCE == 2
+    uint16_t spd = vssSpeedKmh100;
   #else
-    uint16_t spd = 0;
+    uint16_t spd = serialSpeedKmh100;
   #endif
 
   Serial.println("--- Status ---");
@@ -155,6 +222,10 @@ void print_heartbeat() {
   Serial.print("  Main:   "); Serial.println(cruiseMain    ? "ON"       : "off");
   Serial.print("  Gear:   "); Serial.println(gearInDrive   ? "Drive"    : "Park");
   Serial.print("  Speed:  "); Serial.println(spd);
+  Serial.print("  SetSpd: "); Serial.print(cruiseSetSpeed); Serial.println(" km/h");
+  #if EXTERNAL_SPEED_DEVICE
+  Serial.print("  CAN spd:"); Serial.println(canSpeedKmh100);
+  #endif
   Serial.print("  TX ok:  "); Serial.println(txOk);
   Serial.print("  TX err: "); Serial.println(txError);
   Serial.println("--------------");
@@ -208,11 +279,15 @@ void send_pcm_cruise(bool cruise_active) {
 
 // 0x1D3 — PCM_CRUISE_2 (8 bytes, toyota_checksum)
 // DBC: MAIN_ON at 15|1@0+ (Motorola) = byte 1, bit 7
-void send_pcm_cruise_2(bool main_on) {
+// DBC: SET_SPEED at 23|8@0+ (Motorola) = byte 2, 8 bits, 1 km/h, unsigned
+// DBC: LOW_SPEED_LOCKOUT at 14|2@0+ = byte 1, bits 6-5 (0 = unlocked)
+void send_pcm_cruise_2(bool main_on, uint8_t set_speed_kmh) {
   uint8_t data[8] = {0, 0, 0, 0, 0, 0, 0, 0};
   if (main_on) {
     data[1] = 0x80;  // MAIN_ON = byte 1, bit 7 (DBC bit 15 Motorola)
   }
+  // LOW_SPEED_LOCKOUT = 0 (bits 6-5 of byte 1, already 0)
+  data[2] = set_speed_kmh;  // SET_SPEED
   data[7] = toyota_checksum(0x1D3, data, 8);
   sendMsg(0x1D3, data, 8);
 }
@@ -433,9 +508,27 @@ void check_buttons() {
   // Cruise engage/disengage toggle
   if (digitalRead(CRUISE_BUTTON_PIN) == HIGH && (now - lastDebounce_cruise) > DEBOUNCE_MS) {
     lastDebounce_cruise = now;
+    prevCruiseEngaged = cruiseEngaged;
     cruiseEngaged = !cruiseEngaged;
-    Serial.print("Cruise: ");
-    Serial.println(cruiseEngaged ? "ENGAGED" : "disengaged");
+
+    if (cruiseEngaged && !prevCruiseEngaged) {
+      // SET moment: capture current speed
+      #if EXTERNAL_SPEED_DEVICE
+        cruiseSetSpeed = (uint8_t)(canSpeedKmh100 / 100);
+      #elif SPEED_SOURCE == 2
+        cruiseSetSpeed = (uint8_t)(vssSpeedKmh100 / 100);
+      #elif SPEED_SOURCE == 1
+        cruiseSetSpeed = (uint8_t)((uint32_t)analogRead(SPEED_POT_PIN) * 120 / 1023);
+      #else
+        cruiseSetSpeed = (uint8_t)(serialSpeedKmh100 / 100);
+      #endif
+      Serial.print("Cruise: ENGAGED at ");
+      Serial.print(cruiseSetSpeed);
+      Serial.println(" km/h");
+    } else {
+      cruiseSetSpeed = 0;
+      Serial.println("Cruise: disengaged");
+    }
   }
 
   // Main on/off toggle
@@ -469,6 +562,18 @@ void setup() {
   pinMode(MAIN_BUTTON_PIN, INPUT);
   pinMode(GEAR_BUTTON_PIN, INPUT);
 
+  // VSS interrupt setup
+  #if SPEED_SOURCE == 2
+  pinMode(VSS_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(VSS_PIN), vssISR, FALLING);
+  Serial.print(F("Speed source: VSS on pin "));
+  Serial.println(VSS_PIN);
+  #elif SPEED_SOURCE == 1
+  Serial.println(F("Speed source: potentiometer"));
+  #else
+  Serial.println(F("Speed source: serial (type mph + enter)"));
+  #endif
+
   // Init MCP2515
   while (CAN.begin(MCP_ANY, CAN_500KBPS, MCP_16MHZ) != CAN_OK) {
     Serial.println("CAN init failed, retrying...");
@@ -481,6 +586,7 @@ void setup() {
   Serial.print("REAL_EPS_CONNECTED:   "); Serial.println(REAL_EPS_CONNECTED ? "true" : "false");
   Serial.print("REAL_SAS_CONNECTED:   "); Serial.println(REAL_SAS_CONNECTED ? "true" : "false");
   Serial.print("REAL_PEDAL_CONNECTED: "); Serial.println(REAL_PEDAL_CONNECTED ? "true" : "false");
+  Serial.print("EXTERNAL_SPEED_DEVICE:"); Serial.println(EXTERNAL_SPEED_DEVICE ? "true (0xAA/0xB4 from CAN)" : "false");
   Serial.print("SEND_ACC_CONTROL:     "); Serial.println(SEND_ACC_CONTROL ? "true (WARNING!)" : "false");
   Serial.println("--------------");
 }
@@ -492,8 +598,30 @@ void setup() {
 void loop() {
   unsigned long now = micros();
 
-  // Speed in km/h * 100. Set via serial: type a number (mph) and hit enter.
-  #if USE_SPEED_POT
+  // Speed in km/h * 100.
+  #if SPEED_SOURCE == 2
+    // VSS: update speed from pulse count every VSS_SAMPLE_MS
+    // now is in micros; vssLastSampleMs is in millis
+    unsigned long nowMs = now / 1000;
+    if (nowMs - vssLastSampleMs >= (unsigned long)VSS_SAMPLE_MS) {
+      noInterrupts();
+      unsigned long count = vssPulseCount;
+      interrupts();
+      unsigned long pulses = count - vssLastCount;
+      vssLastCount = count;
+      unsigned long elapsedMs = nowMs - vssLastSampleMs;
+      vssLastSampleMs = nowMs;
+      // speed_kmh * 100 = (pulses / elapsedMs * 1000) / VSS_PULSES_PER_KM * 3600 * 100
+      //                  = pulses * 360000000 / (elapsedMs * VSS_PULSES_PER_KM)
+      // Use 64-bit to avoid overflow (pulses * 360000000 can exceed uint32 at ~12 pulses)
+      if (elapsedMs > 0 && pulses > 0) {
+        vssSpeedKmh100 = (uint16_t)((uint64_t)pulses * 360000000ULL / ((uint64_t)elapsedMs * VSS_PULSES_PER_KM));
+      } else if (pulses == 0) {
+        vssSpeedKmh100 = 0;
+      }
+    }
+    uint16_t spd = vssSpeedKmh100;
+  #elif SPEED_SOURCE == 1
     uint16_t spd = (uint32_t)analogRead(SPEED_POT_PIN) * 12000 / 1023;
   #else
     uint16_t spd = serialSpeedKmh100;
@@ -561,7 +689,7 @@ void loop() {
     #endif
 
     #if SEND_PCM_CRUISE_2
-      send_pcm_cruise_2(cruiseMain);
+      send_pcm_cruise_2(cruiseMain, cruiseSetSpeed);
     #endif
 
     #if SEND_PRE_COLLISION
@@ -604,6 +732,11 @@ void loop() {
       send_gear_packet(gearInDrive);
     #endif
   }
+
+  // --- CAN receive: read speed from external VSS device ---
+  #if EXTERNAL_SPEED_DEVICE
+    check_can_speed();
+  #endif
 
   // --- Serial speed input + button handling ---
   check_serial();
