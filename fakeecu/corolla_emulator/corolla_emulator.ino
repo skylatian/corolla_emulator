@@ -67,6 +67,8 @@ MCP_CAN CAN(9);  // Seeed CAN Bus Shield v2: CS on D9 (not D10)
 #define MAIN_BUTTON_PIN    6   // MAIN: toggle cruise main on/off
 #define GEAR_BUTTON_PIN    8   // Toggle gear: Drive <-> Park
 #define SPEED_POT_PIN      A0  // Potentiometer for wheel/vehicle speed (SPEED_SOURCE 1)
+#define BRAKE_PIN          A1  // Brake pedal switch (NC pair: closed=not pressed, open=pressed)
+                               // Uses INPUT_PULLUP — wire break reads as "pressed" (fail-safe)
 
 // Speed source: 0 = serial (type mph + enter), 1 = analog pot, 2 = VSS pulse counter
 #define SPEED_SOURCE       0
@@ -122,6 +124,7 @@ uint8_t cruiseState = CRUISE_MAIN_ON;  // Start with MAIN on (matches old defaul
 bool cruiseEngaged = false;    // CRUISE_ACTIVE in 0x1D2 (derived from state)
 bool cruiseMain = true;        // MAIN_ON in 0x1D3 (derived from state)
 bool gearInDrive = true;       // true = Drive, false = Park
+bool brakePressed = false;     // Brake pedal state from NC switch (fail-safe: true on wire break)
 uint8_t cruiseSetSpeed = 0;    // Captured speed at SET moment (km/h)
 uint8_t msg_counter_1d2 = 0;  // Unused — kept for future rolling counter if needed
 uint8_t msg_counter_201 = 0;  // Counter for 0x201 (GAS_SENSOR, 4-bit rolling)
@@ -413,8 +416,11 @@ void send_pcm_cruise_2(bool main_on, uint8_t set_speed_kmh) {
 // 0x224 — BRAKE_MODULE (8 bytes, no checksum in DBC)
 // Byte 0 bit 5: BRAKE_PRESSED
 void send_brake_module() {
-  // All zeros = brake not pressed
-  sendMsg(0x224, zeros, 8);
+  uint8_t data[8] = {0};
+  if (brakePressed) {
+    data[0] = (1 << 5);  // Set bit 5
+  }
+  sendMsg(0x224, data, 8);
 }
 
 // 0x3BC — GEAR_PACKET (8 bytes, no checksum in DBC)
@@ -803,6 +809,7 @@ void setup() {
   pinMode(CANCEL_BUTTON_PIN, INPUT);
   pinMode(MAIN_BUTTON_PIN, INPUT);
   pinMode(GEAR_BUTTON_PIN, INPUT);
+  pinMode(BRAKE_PIN, INPUT_PULLUP);  // NC switch: LOW=not pressed, HIGH=pressed (or wire break — fail-safe)
 
   // VSS interrupt setup
   #if SPEED_SOURCE == 2
@@ -869,6 +876,10 @@ void loop() {
   #else
     uint16_t spd = serialSpeedKmh100;
   #endif
+
+  // Brake pedal: read every loop iteration (safety-critical, no debounce)
+  // NC switch with INPUT_PULLUP: HIGH = pressed (or wire break — fail-safe), LOW = not pressed
+  brakePressed = (digitalRead(BRAKE_PIN) == HIGH);
 
   // --- 83 Hz tier: WHEEL_SPEEDS, STEER_ANGLE_SENSOR ---
   // STEER_ANGLE_SENSOR needs 80 Hz per carstate parser

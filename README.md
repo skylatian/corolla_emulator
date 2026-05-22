@@ -77,6 +77,22 @@ When no stalk device is detected, physical buttons on the emulator work:
 | D5 | CANCEL: disengage cruise (set speed preserved) |
 | D6 | MAIN: toggle cruise on/off |
 | D8 | Gear: Drive ↔ Park |
+| A1 | Brake pedal switch (NC pair, INPUT_PULLUP) |
+
+## Brake Pedal Sensor
+
+The emulator reads the car's brake pedal switch (Stop Light Switch S7) to report `BRAKE_PRESSED` in CAN message 0x224 (`BRAKE_MODULE`).
+
+**Wiring**: Uses the **NC (Normally Closed) pair** (pins 1-2 on the 4-pin switch). One terminal to emulator pin A1, other terminal to GND.
+
+**Fail-safe design**: The NC pair is closed when the brake is NOT pressed and opens when pressed. With `INPUT_PULLUP`:
+- Brake not pressed → switch closed → pin reads LOW → `brakePressed = false`
+- Brake pressed → switch opens → pin reads HIGH → `brakePressed = true`
+- Wire break → pin reads HIGH (pull-up) → `brakePressed = true` (safe default)
+
+Wire break is indistinguishable from "brake pressed" — OP will not accelerate. This is the desired failure mode.
+
+**Roadmap**: Upgrade to dual-channel redundancy using both NC (pins 1-2) and NO (pins 3-4) pairs from the switch. Cross-check that the two channels always read opposite states; any agreement = sensor fault = report brake pressed. This catches additional failure modes (shorts, switch mechanism failure) beyond wire breaks.
 
 ## Speed Sources
 
