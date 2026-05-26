@@ -338,6 +338,7 @@ void print_heartbeat() {
   Serial.print("  Cruise: "); Serial.println(cruiseEngaged ? "ENGAGED" : "off");
   Serial.print("  Main:   "); Serial.println(cruiseMain    ? "ON"       : "off");
   Serial.print("  Gear:   "); Serial.println(gearInDrive   ? "Drive"    : "Park");
+  Serial.print("  Brake:  "); Serial.println(brakePressed  ? "PRESSED"  : "off");
   Serial.print("  Speed:  "); Serial.println(spd);
   Serial.print("  SetSpd: "); Serial.print(cruiseSetSpeed); Serial.println(" km/h");
   #if AUTO_DETECT_SPEED_DEVICE
@@ -560,7 +561,7 @@ const uint8_t  bg_7byte_count = 3;
 const uint16_t bg_8byte[] = {
   0x24, 0x1D0, 0x2C1, 0x344,
   0x380, 0x381, 0x389, 0x38F, 0x399, 0x3A5, 0x3B0, 0x3B1, 0x3B7,
-  0x3E8, 0x3E9, 0x3F9, 0x411, 0x412, 0x413, 0x414, 0x420,
+  0x3E8, 0x3E9, 0x3F9, 0x411, 0x413, 0x414, 0x420,
   0x45A, 0x489, 0x48A, 0x48B, 0x4AC, 0x4D3, 0x4FF,
   0x610, 0x611, 0x614, 0x615, 0x619, 0x61A,
   0x621, 0x622, 0x623, 0x624,
