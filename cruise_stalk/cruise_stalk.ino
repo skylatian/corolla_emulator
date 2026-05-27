@@ -6,12 +6,23 @@
 // Hardware: Longan CANBed V1 (ATmega32U4, Leonardo bootloader, 16MHz)
 //           Onboard MCP2515 CAN controller, CS=D17
 //           Stalk signal → A0 (resistance-based, all buttons on one wire)
+//           DPDT relay on D4 — switches stalk wiring between stock ECU and A0
 //
 // Library:  Longan Labs Arduino_CAN_BUS_MCP2515
 //           https://github.com/Longan-Labs/Aruino_CAN_BUS_MCP2515
 //
 // Sends:
-//   0x69 CRUISE_STALK at 20 Hz — 2 bytes: button event + MAIN state
+//   0x69 CRUISE_STALK at 20 Hz — 3 bytes: button event + MAIN state + checksum
+//
+// Relay behavior:
+//   The stalk's 2 analog wires are routed through a DPDT relay.
+//   - Relay de-energized (NC): stalk wired to stock ECU (normal cruise)
+//   - Relay energized (NO):   stalk wired to Arduino A0 (OP cruise via CAN)
+//   The relay is energized when 0x2E4 (STEERING_LKA) is seen on the CAN bus,
+//   indicating openpilot is actively running (onroad). When 0x2E4 disappears
+//   (C3 goes offroad or disconnects), the relay de-energizes after a timeout,
+//   returning the stalk to the stock ECU. A CANCEL event is sent on timeout
+//   so the emulator disengages cruise cleanly.
 //
 // The stalk is a 2-wire resistance-based device. Each position (SET/-,
 // RES/+, CANCEL, MAIN) produces a different resistance value on A0.
@@ -28,9 +39,21 @@
 
 #define CAN_CS_PIN  17  // CANBed V1 onboard MCP2515 CS pin
 #define STALK_PIN   A0  // Analog input for stalk resistance
+#define RELAY_PIN   4   // DPDT relay control: HIGH = stalk to Arduino, LOW = stalk to stock ECU
 
 // CAN message ID for stalk data (not used by any Toyota DBC message)
 #define STALK_CAN_ID  0x69
+
+// CAN message ID to detect openpilot onroad (only OP sends this via panda)
+#define C3_DETECT_ID  0x2E4
+
+// Timeout: how long without 0x2E4 before we consider C3 gone and flip relay back.
+// OP sends STEERING_LKA at ~50 Hz, so 500ms = ~25 missed frames.
+#define C3_TIMEOUT_MS  500
+
+// What to do on C3 timeout: send a CANCEL event so emulator disengages cruise.
+// Set to false to just flip the relay without sending CANCEL.
+#define C3_TIMEOUT_SEND_CANCEL  true
 
 // ============================================================================
 // RESISTANCE THRESHOLDS (ADC values, 0-1023)
@@ -40,17 +63,19 @@
 // Then read ADC values for each button position.
 // ============================================================================
 
-#define STALK_SET_MIN      100
-#define STALK_SET_MAX      200
+// note: these values are all with a ~470 ohm resistor (measured about 466)
 
-#define STALK_RES_MIN      250
-#define STALK_RES_MAX      350
+#define STALK_SET_MIN      535 // mid ~585
+#define STALK_SET_MAX      635
 
-#define STALK_CANCEL_MIN   400
-#define STALK_CANCEL_MAX   500
+#define STALK_RES_MIN      295 // mid ~345
+#define STALK_RES_MAX      395
 
-#define STALK_MAIN_MIN     550
-#define STALK_MAIN_MAX     650
+#define STALK_CANCEL_MIN   735 // mid ~785
+#define STALK_CANCEL_MAX   835
+
+#define STALK_MAIN_MIN     0 // basically zero
+#define STALK_MAIN_MAX     50
 
 // ============================================================================
 // BUTTON EVENT CODES (byte 0 of CAN message)
@@ -83,6 +108,10 @@ bool mainOn = false;              // MAIN toggle state (flips on each MAIN press
 uint8_t pendingEvent = BTN_NONE;  // Button event to send (cleared after one frame)
 unsigned long lastPressMs = 0;    // Debounce timestamp
 
+// C3/relay state
+bool c3Present = false;           // true when 0x2E4 seen within timeout
+unsigned long lastC3Ms = 0;       // millis() of last 0x2E4 received
+
 // TX stats
 uint32_t txOk    = 0;
 uint32_t txError = 0;
@@ -92,7 +121,7 @@ uint32_t txError = 0;
 // ============================================================================
 
 // Decode ADC value into button press. Returns BTN_NONE if no button or
-// if within debounce lockout.
+// if within debounce lockout. Only call when relay is energized (c3Present).
 uint8_t read_stalk() {
   int adc = analogRead(STALK_PIN);
   uint8_t btn = BTN_NONE;
@@ -174,6 +203,47 @@ void send_stalk_msg(uint8_t button_event) {
 }
 
 // ============================================================================
+// CAN RECEIVE — detect C3 presence via 0x2E4
+// ============================================================================
+
+void check_can_receive() {
+  unsigned long nowMs = millis();
+
+  // Drain all available frames from MCP2515 RX buffers
+  while (CAN.checkReceive() == CAN_MSGAVAIL) {
+    unsigned long rxId;
+    uint8_t rxLen;
+    uint8_t rxBuf[8];
+    CAN.readMsgBuf(&rxId, &rxLen, rxBuf);
+
+    if (rxId == C3_DETECT_ID) {
+      lastC3Ms = nowMs;
+
+      if (!c3Present) {
+        c3Present = true;
+        digitalWrite(RELAY_PIN, HIGH);  // Route stalk to Arduino
+        Serial.println(F("C3 DETECTED (0x2E4) — relay ON, stalk to Arduino"));
+      }
+    }
+  }
+
+  // Timeout: C3 gone
+  if (c3Present && (nowMs - lastC3Ms) >= C3_TIMEOUT_MS) {
+    c3Present = false;
+    digitalWrite(RELAY_PIN, LOW);  // Route stalk back to stock ECU
+    Serial.println(F("C3 LOST — relay OFF, stalk to stock ECU"));
+
+    #if C3_TIMEOUT_SEND_CANCEL
+      // Send CANCEL so emulator disengages cruise cleanly
+      pendingEvent = BTN_CANCEL;
+      send_stalk_msg(pendingEvent);
+      pendingEvent = BTN_NONE;
+      Serial.println(F("  Sent CANCEL to emulator"));
+    #endif
+  }
+}
+
+// ============================================================================
 // SETUP
 // ============================================================================
 
@@ -181,10 +251,21 @@ void setup() {
   Serial.begin(115200);
   Serial.println(F("Cruise Stalk Device starting..."));
 
+  // Relay pin — start de-energized (NC = stalk to stock ECU)
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
+
   Serial.print(F("Stalk pin: A"));
   Serial.println(STALK_PIN - A0);
+  Serial.print(F("Relay pin: D"));
+  Serial.println(RELAY_PIN);
   Serial.print(F("CAN ID: 0x"));
   Serial.println(STALK_CAN_ID, HEX);
+  Serial.print(F("C3 detect: 0x"));
+  Serial.println(C3_DETECT_ID, HEX);
+  Serial.print(F("C3 timeout: "));
+  Serial.print(C3_TIMEOUT_MS);
+  Serial.println(F("ms"));
 
   // Init onboard MCP2515
   while (CAN.begin(MCP_ANY, CAN_500KBPS, MCP_16MHZ) != CAN_OK) {
@@ -203,13 +284,18 @@ void loop() {
   unsigned long now = micros();
   unsigned long nowMs = now / 1000;
 
-  // Read stalk input (non-blocking, with debounce)
-  uint8_t btn = read_stalk();
-  if (btn != BTN_NONE) {
-    pendingEvent = btn;  // Latch event for next CAN frame
+  // Check for C3 presence and manage relay
+  check_can_receive();
+
+  // Only read stalk when relay is energized (stalk wired to A0)
+  if (c3Present) {
+    uint8_t btn = read_stalk();
+    if (btn != BTN_NONE) {
+      pendingEvent = btn;  // Latch event for next CAN frame
+    }
   }
 
-  // --- 20 Hz: send stalk CAN message ---
+  // --- 20 Hz: send stalk CAN message (always — heartbeat for emulator) ---
   if (now - lastMicros_20hz >= INTERVAL_20HZ) {
     lastMicros_20hz = now;
     send_stalk_msg(pendingEvent);
@@ -221,8 +307,12 @@ void loop() {
     lastMillis_hb = nowMs;
     Serial.print(F("MAIN: "));
     Serial.print(mainOn ? "ON" : "OFF");
-    Serial.print(F("  ADC: "));
-    Serial.print(analogRead(STALK_PIN));
+    Serial.print(F("  C3: "));
+    Serial.print(c3Present ? "ON" : "off");
+    if (c3Present) {
+      Serial.print(F("  ADC: "));
+      Serial.print(analogRead(STALK_PIN));
+    }
     Serial.print(F("  TX ok: "));
     Serial.print(txOk);
     Serial.print(F("  err: "));
