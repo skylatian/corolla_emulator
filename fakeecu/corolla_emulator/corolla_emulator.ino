@@ -27,7 +27,7 @@ MCP_CAN CAN(9);  // Seeed CAN Bus Shield v2: CS on D9 (not D10)
 #define SEND_ACC_CONTROL      false  // 0x343 — WARNING: triggers relay_malfunction if true!
 #define SEND_BRAKE_MODULE     true   // 0x224 — required by panda safety RX checks
 #define SEND_PCM_CRUISE_2     true   // 0x1D3 — MAIN_ON flag (cruise availability)
-#define SEND_GEAR_PACKET      true   // 0x3BC — gear position
+#define SEND_GEAR_PACKET      false  // 0x3BC — gear position (moved to VSS speed device)
 #define SEND_BODY_CONTROL     true   // 0x620 — doors/seatbelt state
 #define SEND_WHEEL_SPEEDS     true   // 0xAA  — required by panda safety RX checks (83 Hz)
 #define SEND_SPEED            true   // 0xB4  — vehicle speed (also EPS init message)
@@ -65,13 +65,7 @@ MCP_CAN CAN(9);  // Seeed CAN Bus Shield v2: CS on D9 (not D10)
 #define RES_BUTTON_PIN     4   // RES: resume cruise / increment set speed
 #define CANCEL_BUTTON_PIN  5   // CANCEL: disengage cruise (set speed preserved)
 #define MAIN_BUTTON_PIN    6   // MAIN: toggle cruise main on/off
-// Park/Neutral safety switch — direct read (not a toggle button)
-// Car's neutral safety switch: P/N = below 2V, D/R = 10-14V
-// Use a 10K/4.7K voltage divider from switch output:
-//   12V → ~3.8V (HIGH = Drive), 2V → ~0.6V (LOW = Park/Neutral)
-// With INPUT_PULLUP: wire break → HIGH → Drive (NOT fail-safe to Park)
-// TODO: invert logic with pull-down if fail-safe-to-Park is needed
-#define PARK_SWITCH_PIN    8
+// D8: freed up — was park switch, now handled by VSS speed device
 #define SPEED_POT_PIN      A0  // Potentiometer for wheel/vehicle speed (SPEED_SOURCE 1)
 #define BRAKE_PIN          A1  // Brake pedal switch (NC pair: closed=not pressed, open=pressed)
                                // Uses INPUT_PULLUP — wire break reads as "pressed" (fail-safe)
@@ -79,7 +73,7 @@ MCP_CAN CAN(9);  // Seeed CAN Bus Shield v2: CS on D9 (not D10)
 // Spare inputs — reserved for future signals. Wire to screw terminals on PCB.
 // All set to INPUT_PULLUP by default; change per-signal when wired.
 // NOTE: D2 is taken by MCP2515 INT (CAN shield), D7 by VSS (when SPEED_SOURCE==2)
-#define SPARE_INPUT_1  A2  // Digital-capable (e.g., reverse light)
+#define SPARE_INPUT_1  A2  // Digital-capable (spare)
 #define SPARE_INPUT_2  A3  // Digital-capable (e.g., brake NO pair for dual-channel)
 #define SPARE_INPUT_3  A4  // Digital-capable (future sensor)
 
@@ -110,7 +104,7 @@ MCP_CAN CAN(9);  // Seeed CAN Bus Shield v2: CS on D9 (not D10)
 #define INTERVAL_25HZ   40000   // 25 Hz (40 ms) — EPS_STATUS
 #define INTERVAL_10HZ   100000  // 10 Hz — background msgs
 #define INTERVAL_3HZ    333333  // ~3 Hz — BODY_CONTROL_STATE
-#define INTERVAL_1HZ    1000000 // 1 Hz — GEAR_PACKET, 0x4CB
+// INTERVAL_1HZ removed — GEAR_PACKET moved to VSS speed device
 
 unsigned long lastMicros_83hz = 0;
 unsigned long lastMicros_50hz = 0;
@@ -119,7 +113,7 @@ unsigned long lastMicros_33hz = 0;
 unsigned long lastMicros_25hz = 0;
 unsigned long lastMicros_10hz = 0;
 unsigned long lastMicros_3hz  = 0;
-unsigned long lastMicros_1hz  = 0;
+// lastMicros_1hz removed — GEAR_PACKET moved to VSS speed device
 unsigned long lastMillis_hb   = 0;  // heartbeat
 #define HEARTBEAT_MS 2000
 
@@ -136,7 +130,7 @@ unsigned long lastMillis_hb   = 0;  // heartbeat
 uint8_t cruiseState = CRUISE_MAIN_ON;  // Start with MAIN on (matches old default)
 bool cruiseEngaged = false;    // CRUISE_ACTIVE in 0x1D2 (derived from state)
 bool cruiseMain = true;        // MAIN_ON in 0x1D3 (derived from state)
-bool gearInDrive = true;       // true = Drive, false = Park
+// Gear state moved to VSS speed device (sends 0x3BC)
 bool brakePressed = false;     // Brake pedal state from NC switch (fail-safe: true on wire break)
 uint8_t cruiseSetSpeed = 0;    // Captured speed at SET moment (km/h)
 uint8_t msg_counter_1d2 = 0;  // Unused — kept for future rolling counter if needed
@@ -349,7 +343,7 @@ void print_heartbeat() {
   Serial.print("  State:  "); Serial.println(stateNames[cruiseState]);
   Serial.print("  Cruise: "); Serial.println(cruiseEngaged ? "ENGAGED" : "off");
   Serial.print("  Main:   "); Serial.println(cruiseMain    ? "ON"       : "off");
-  Serial.print("  Gear:   "); Serial.println(gearInDrive   ? "Drive"    : "Park");
+  Serial.print("  Gear:   VSS device");
   Serial.print("  Brake:  "); Serial.println(brakePressed  ? "PRESSED"  : "off");
   Serial.print("  Speed:  "); Serial.println(spd);
   Serial.print("  SetSpd: "); Serial.print(cruiseSetSpeed); Serial.println(" km/h");
@@ -436,15 +430,7 @@ void send_brake_module() {
   sendMsg(0x224, data, 8);
 }
 
-// 0x3BC — GEAR_PACKET (8 bytes, no checksum in DBC)
-// Byte 1: gear position. 0x00 = Drive, 0x20 = not-in-drive (Park/Neutral)
-void send_gear_packet(bool in_drive) {
-  uint8_t data[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-  if (!in_drive) {
-    data[1] = 0x20;  // Not in drive
-  }
-  sendMsg(0x3BC, data, 8);
-}
+// 0x3BC — GEAR_PACKET: moved to VSS speed device
 
 // 0x620 — BODY_CONTROL_STATE (8 bytes, no checksum in DBC)
 // Doors closed, seatbelt on — all zeros is safe defaults
@@ -575,7 +561,7 @@ const uint16_t bg_8byte[] = {
   0x380, 0x381, 0x389, 0x38F, 0x399, 0x3A5, 0x3B0, 0x3B1, 0x3B7,
   0x3E8, 0x3E9, 0x3F9, 0x411, 0x413, 0x414, 0x420,
   0x45A, 0x489, 0x48A, 0x48B, 0x4AC, 0x4D3, 0x4FF,
-  0x610, 0x611, 0x614, 0x615, 0x619, 0x61A,
+  0x610, 0x611, 0x615, 0x619, 0x61A,  // 0x614 (BLINKERS_STATE) moved to cruise stalk device
   0x621, 0x622, 0x623, 0x624,
   0x638, 0x63C, 0x63D, 0x640, 0x680, 0x6F3,
   0x770, 0x778, 0x7C6, 0x7CE,
@@ -798,9 +784,7 @@ void check_buttons() {
   }
   #endif
 
-  // Gear: direct read from park/neutral safety switch (not a toggle)
-  // HIGH = Drive (voltage above threshold), LOW = Park/Neutral
-  gearInDrive = (digitalRead(PARK_SWITCH_PIN) == HIGH);
+  // Gear: handled by VSS speed device (sends 0x3BC)
 }
 
 // ============================================================================
@@ -817,7 +801,7 @@ void setup() {
   pinMode(RES_BUTTON_PIN, INPUT);
   pinMode(CANCEL_BUTTON_PIN, INPUT);
   pinMode(MAIN_BUTTON_PIN, INPUT);
-  pinMode(PARK_SWITCH_PIN, INPUT_PULLUP);  // Park switch: HIGH=Drive, LOW=Park/Neutral (or wire break → Drive)
+  // Park switch removed — gear handled by VSS speed device
   pinMode(BRAKE_PIN, INPUT_PULLUP);  // NC switch: LOW=not pressed, HIGH=pressed (or wire break — fail-safe)
 
   // Spare inputs — reserved, not yet read
@@ -1000,14 +984,7 @@ void loop() {
     #endif
   }
 
-  // --- 1 Hz tier: GEAR_PACKET ---
-  if (now - lastMicros_1hz >= INTERVAL_1HZ) {
-    lastMicros_1hz = now;
-
-    #if SEND_GEAR_PACKET
-      send_gear_packet(gearInDrive);
-    #endif
-  }
+  // 1 Hz tier removed — GEAR_PACKET moved to VSS speed device
 
   // --- CAN receive: auto-detect external devices (VSS speed, cruise stalk) ---
   check_can_receive();

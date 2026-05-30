@@ -1,18 +1,21 @@
 // ============================================================================
-// Cruise Stalk CAN Device — Standalone Stalk Reader
-// Reads Toyota cruise stalk resistance on analog pin, decodes button press,
-// and sends CAN message 0x69 at 20 Hz.
+// Cruise Stalk CAN Device — Standalone Stalk + Blinker Reader
+// Reads Toyota cruise stalk resistance on analog pin and blinker switch
+// state on two digital pins. Sends CAN messages at 20 Hz.
 //
 // Hardware: Longan CANBed V1 (ATmega32U4, Leonardo bootloader, 16MHz)
 //           Onboard MCP2515 CAN controller, CS=D17
 //           Stalk signal → A0 (resistance-based, all buttons on one wire)
 //           DPDT relay on D4 — switches stalk wiring between stock ECU and A0
+//           Left blinker sense → BLINKER_LEFT_PIN (12V via divider, LOW = active)
+//           Right blinker sense → BLINKER_RIGHT_PIN (12V via divider, LOW = active)
 //
 // Library:  Longan Labs Arduino_CAN_BUS_MCP2515
 //           https://github.com/Longan-Labs/Aruino_CAN_BUS_MCP2515
 //
 // Sends:
-//   0x69 CRUISE_STALK at 20 Hz — 3 bytes: button event + MAIN state + checksum
+//   0x69  CRUISE_STALK   at 20 Hz — 3 bytes: button event + MAIN state + checksum
+//   0x614 BLINKERS_STATE at 20 Hz — 8 bytes: TURN_SIGNALS (1=left, 2=right, 3=none)
 //
 // Relay behavior:
 //   The stalk's 2 analog wires are routed through a DPDT relay.
@@ -28,6 +31,11 @@
 // RES/+, CANCEL, MAIN) produces a different resistance value on A0.
 // All positions are momentary (spring-return). MAIN is tracked as a
 // toggle internally: each MAIN pulse flips the mainOn bool.
+//
+// Blinker sense lines are 12V from the car's blinker ECU, pulled to ground
+// by the blinker stalk. Read via voltage dividers. Signal is steady (not
+// flashing like the bulbs). Hazards are handled by a separate flasher relay
+// and won't pull both lines low simultaneously.
 // ============================================================================
 
 #include <SPI.h>
@@ -40,6 +48,12 @@
 #define CAN_CS_PIN  17  // CANBed V1 onboard MCP2515 CS pin
 #define STALK_PIN   A0  // Analog input for stalk resistance
 #define RELAY_PIN   4   // DPDT relay control: HIGH = stalk to Arduino, LOW = stalk to stock ECU
+
+// Blinker sense pins — INPUT_PULLUP, LOW = blinker active
+// 12V sense lines through voltage dividers to 5V logic.
+// Assign actual pin numbers when wiring.
+#define BLINKER_LEFT_PIN   5   // Left blinker sense (LOW = left turn active)
+#define BLINKER_RIGHT_PIN  6   // Right blinker sense (LOW = right turn active)
 
 // CAN message ID for stalk data (not used by any Toyota DBC message)
 #define STALK_CAN_ID  0x69
@@ -111,6 +125,9 @@ unsigned long lastPressMs = 0;    // Debounce timestamp
 // C3/relay state
 bool c3Present = false;           // true when 0x2E4 seen within timeout
 unsigned long lastC3Ms = 0;       // millis() of last 0x2E4 received
+
+// Blinker state: DBC TURN_SIGNALS value (1=left, 2=right, 3=none)
+uint8_t turnSignals = 3;  // default: none
 
 // TX stats
 uint32_t txOk    = 0;
@@ -202,6 +219,22 @@ void send_stalk_msg(uint8_t button_event) {
   sendMsg(STALK_CAN_ID, data, 3);
 }
 
+// 0x614 — BLINKERS_STATE (8 bytes, no checksum)
+// DBC: TURN_SIGNALS at 29|2@0+ — byte 3, bits 5:4
+// Values: 1=left, 2=right, 3=none
+void send_blinkers_state(uint8_t turn_signals) {
+  uint8_t data[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  data[3] = (turn_signals & 0x03) << 4;
+  sendMsg(0x614, data, 8);
+}
+
+// Read blinker switches and return DBC TURN_SIGNALS value
+uint8_t read_blinkers() {
+  if (digitalRead(BLINKER_LEFT_PIN) == LOW)  return 1;  // left
+  if (digitalRead(BLINKER_RIGHT_PIN) == LOW) return 2;  // right
+  return 3;                                               // none
+}
+
 // ============================================================================
 // CAN RECEIVE — detect C3 presence via 0x2E4
 // ============================================================================
@@ -255,6 +288,10 @@ void setup() {
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, LOW);
 
+  // Blinker sense pins
+  pinMode(BLINKER_LEFT_PIN, INPUT_PULLUP);
+  pinMode(BLINKER_RIGHT_PIN, INPUT_PULLUP);
+
   Serial.print(F("Stalk pin: A"));
   Serial.println(STALK_PIN - A0);
   Serial.print(F("Relay pin: D"));
@@ -295,11 +332,15 @@ void loop() {
     }
   }
 
-  // --- 20 Hz: send stalk CAN message (always — heartbeat for emulator) ---
+  // --- Read blinkers (every loop — digitalRead is ~4µs) ---
+  turnSignals = read_blinkers();
+
+  // --- 20 Hz: send stalk + blinker CAN messages ---
   if (now - lastMicros_20hz >= INTERVAL_20HZ) {
     lastMicros_20hz = now;
     send_stalk_msg(pendingEvent);
     pendingEvent = BTN_NONE;  // Clear after sending (pulse behavior)
+    send_blinkers_state(turnSignals);
   }
 
   // --- Heartbeat ---
@@ -312,6 +353,12 @@ void loop() {
     if (c3Present) {
       Serial.print(F("  ADC: "));
       Serial.print(analogRead(STALK_PIN));
+    }
+    Serial.print(F("  Blink: "));
+    switch (turnSignals) {
+      case 1:  Serial.print(F("L")); break;
+      case 2:  Serial.print(F("R")); break;
+      default: Serial.print(F("-")); break;
     }
     Serial.print(F("  TX ok: "));
     Serial.print(txOk);

@@ -1,10 +1,13 @@
 // ============================================================================
-// VSS Speed Device — Standalone CAN Speed Sender
-// Reads Vehicle Speed Sensor (VSS) pulses and broadcasts speed on CAN bus.
+// VSS Speed Device — Standalone CAN Speed + Gear Sender
+// Reads Vehicle Speed Sensor (VSS) pulses and gear selection switches,
+// broadcasts speed and gear position on CAN bus.
 //
 // Hardware: Longan CANBed V1 (ATmega32U4, Leonardo bootloader, 16MHz)
 //           Onboard MCP2515 CAN controller, CS=D17
-//           VSS signal → D7 (hardware interrupt capable on ATmega32U4)
+//           VSS signal → D3 (hardware interrupt capable on ATmega32U4)
+//           Park/Neutral switch → GEAR_PN_PIN (INPUT_PULLUP, LOW = P/N)
+//           Reverse switch → GEAR_REV_PIN (INPUT_PULLUP, LOW = Reverse)
 //
 // Library:  Longan Labs Arduino_CAN_BUS_MCP2515
 //           https://github.com/Longan-Labs/Aruino_CAN_BUS_MCP2515
@@ -12,9 +15,10 @@
 // Sends:
 //   0xAA WHEEL_SPEEDS  at 83 Hz — 4 identical 16-bit BE wheel speeds
 //   0xB4 SPEED         at 50 Hz — 16-bit BE speed with toyota_checksum
+//   0x3BC GEAR_PACKET  at 10 Hz — gear position (D/R/P)
 //
-// This device owns 0xAA and 0xB4 on the bus. The main emulator should have
-// EXTERNAL_SPEED_DEVICE set to true so it doesn't also send these.
+// This device owns 0xAA, 0xB4, and 0x3BC on the bus. The main emulator
+// should have SEND_GEAR_PACKET=false and AUTO_DETECT_SPEED_DEVICE=true.
 // ============================================================================
 
 #include <SPI.h>
@@ -29,15 +33,23 @@
 #define VSS_SAMPLE_MS      500   // Sampling window in ms
 #define CAN_CS_PIN         17    // CANBed V1 onboard MCP2515 CS pin
 
+// Gear selection switches — INPUT_PULLUP, LOW = active
+// Wire through voltage dividers from 12V car signals to 5V logic.
+// Assign actual pin numbers when wiring.
+#define GEAR_PN_PIN        4     // Park/Neutral switch (LOW = Park or Neutral)
+#define GEAR_REV_PIN       5     // Reverse switch (LOW = Reverse)
+
 // ============================================================================
 // TIMING
 // ============================================================================
 
 #define INTERVAL_83HZ  12048   // ~83 Hz (12.048 ms) — WHEEL_SPEEDS
 #define INTERVAL_50HZ  20000   // 50 Hz (20 ms) — SPEED
+#define INTERVAL_10HZ  100000  // 10 Hz (100 ms) — GEAR_PACKET
 
 unsigned long lastMicros_83hz = 0;
 unsigned long lastMicros_50hz = 0;
+unsigned long lastMicros_10hz = 0;
 unsigned long lastMillis_hb   = 0;
 #define HEARTBEAT_MS 2000
 
@@ -51,6 +63,7 @@ volatile unsigned long vssPulseCount = 0;
 unsigned long vssLastSampleMs = 0;
 unsigned long vssLastCount = 0;
 uint16_t speedKmh100 = 0;  // speed in km/h * 100
+uint8_t gearState = 0;     // DBC GEAR value: 0=D, 16=R, 32=P
 
 // TX stats
 uint32_t txOk    = 0;
@@ -115,6 +128,23 @@ void send_speed(uint16_t spd_kmh_x100) {
   sendMsg(0xB4, data, 8);
 }
 
+// 0x3BC — GEAR_PACKET (8 bytes, no checksum in DBC)
+// DBC: GEAR signal at 13|6@0+ — byte 1, bits 5:0
+// Values: 0=D, 16=R, 32=P (P/N combined as P)
+void send_gear_packet(uint8_t gear) {
+  uint8_t data[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  data[1] = gear & 0x3F;
+  sendMsg(0x3BC, data, 8);
+}
+
+// Read gear switches and return DBC GEAR value
+uint8_t read_gear() {
+  // Priority: Reverse > Park/Neutral > Drive
+  if (digitalRead(GEAR_REV_PIN) == LOW) return 16;  // R
+  if (digitalRead(GEAR_PN_PIN) == LOW) return 32;    // P
+  return 0;                                           // D
+}
+
 // ============================================================================
 // SETUP
 // ============================================================================
@@ -122,6 +152,10 @@ void send_speed(uint16_t spd_kmh_x100) {
 void setup() {
   Serial.begin(115200);
   Serial.println(F("VSS Speed Device starting..."));
+
+  // Gear selection switches
+  pinMode(GEAR_PN_PIN, INPUT_PULLUP);
+  pinMode(GEAR_REV_PIN, INPUT_PULLUP);
 
   // VSS input
   pinMode(VSS_PIN, INPUT_PULLUP);
@@ -137,7 +171,7 @@ void setup() {
     delay(500);
   }
   CAN.setMode(MCP_NORMAL);
-  Serial.println(F("CAN BUS init ok — sending 0xAA + 0xB4"));
+  Serial.println(F("CAN BUS init ok — sending 0xAA + 0xB4 + 0x3BC"));
 }
 
 // ============================================================================
@@ -168,6 +202,9 @@ void loop() {
     }
   }
 
+  // --- Gear selection (every loop — digitalRead is ~4µs) ---
+  gearState = read_gear();
+
   // --- 83 Hz: WHEEL_SPEEDS ---
   if (now - lastMicros_83hz >= INTERVAL_83HZ) {
     lastMicros_83hz = now;
@@ -180,6 +217,12 @@ void loop() {
     send_speed(speedKmh100);
   }
 
+  // --- 10 Hz: GEAR_PACKET ---
+  if (now - lastMicros_10hz >= INTERVAL_10HZ) {
+    lastMicros_10hz = now;
+    send_gear_packet(gearState);
+  }
+
   // --- Heartbeat ---
   if (nowMs - lastMillis_hb >= HEARTBEAT_MS) {
     lastMillis_hb = nowMs;
@@ -187,7 +230,14 @@ void loop() {
     Serial.print(speedKmh100 / 100);
     Serial.print(F(" km/h (raw "));
     Serial.print(speedKmh100);
-    Serial.print(F(")  TX ok: "));
+    Serial.print(F(")  Gear: "));
+    switch (gearState) {
+      case 0:  Serial.print(F("D")); break;
+      case 16: Serial.print(F("R")); break;
+      case 32: Serial.print(F("P")); break;
+      default: Serial.print(F("?")); break;
+    }
+    Serial.print(F("  TX ok: "));
     Serial.print(txOk);
     Serial.print(F("  err: "));
     Serial.println(txError);
