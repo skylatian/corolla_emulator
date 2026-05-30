@@ -65,10 +65,23 @@ MCP_CAN CAN(9);  // Seeed CAN Bus Shield v2: CS on D9 (not D10)
 #define RES_BUTTON_PIN     4   // RES: resume cruise / increment set speed
 #define CANCEL_BUTTON_PIN  5   // CANCEL: disengage cruise (set speed preserved)
 #define MAIN_BUTTON_PIN    6   // MAIN: toggle cruise main on/off
-#define GEAR_BUTTON_PIN    8   // Toggle gear: Drive <-> Park
+// Park/Neutral safety switch — direct read (not a toggle button)
+// Car's neutral safety switch: P/N = below 2V, D/R = 10-14V
+// Use a 10K/4.7K voltage divider from switch output:
+//   12V → ~3.8V (HIGH = Drive), 2V → ~0.6V (LOW = Park/Neutral)
+// With INPUT_PULLUP: wire break → HIGH → Drive (NOT fail-safe to Park)
+// TODO: invert logic with pull-down if fail-safe-to-Park is needed
+#define PARK_SWITCH_PIN    8
 #define SPEED_POT_PIN      A0  // Potentiometer for wheel/vehicle speed (SPEED_SOURCE 1)
 #define BRAKE_PIN          A1  // Brake pedal switch (NC pair: closed=not pressed, open=pressed)
                                // Uses INPUT_PULLUP — wire break reads as "pressed" (fail-safe)
+
+// Spare inputs — reserved for future signals. Wire to screw terminals on PCB.
+// All set to INPUT_PULLUP by default; change per-signal when wired.
+// NOTE: D2 is taken by MCP2515 INT (CAN shield), D7 by VSS (when SPEED_SOURCE==2)
+#define SPARE_INPUT_1  A2  // Digital-capable (e.g., reverse light)
+#define SPARE_INPUT_2  A3  // Digital-capable (e.g., brake NO pair for dual-channel)
+#define SPARE_INPUT_3  A4  // Digital-capable (future sensor)
 
 // Speed source: 0 = serial (type mph + enter), 1 = analog pot, 2 = VSS pulse counter
 #define SPEED_SOURCE       0
@@ -134,7 +147,6 @@ unsigned long lastDebounce_set    = 0;
 unsigned long lastDebounce_res    = 0;
 unsigned long lastDebounce_cancel = 0;
 unsigned long lastDebounce_main   = 0;
-unsigned long lastDebounce_gear   = 0;
 #define DEBOUNCE_MS 300
 
 // TX error tracking
@@ -786,13 +798,9 @@ void check_buttons() {
   }
   #endif
 
-  // Gear toggle (always from digital button)
-  if (digitalRead(GEAR_BUTTON_PIN) == HIGH && (now - lastDebounce_gear) > DEBOUNCE_MS) {
-    lastDebounce_gear = now;
-    gearInDrive = !gearInDrive;
-    Serial.print("Gear: ");
-    Serial.println(gearInDrive ? "DRIVE" : "Park");
-  }
+  // Gear: direct read from park/neutral safety switch (not a toggle)
+  // HIGH = Drive (voltage above threshold), LOW = Park/Neutral
+  gearInDrive = (digitalRead(PARK_SWITCH_PIN) == HIGH);
 }
 
 // ============================================================================
@@ -809,8 +817,13 @@ void setup() {
   pinMode(RES_BUTTON_PIN, INPUT);
   pinMode(CANCEL_BUTTON_PIN, INPUT);
   pinMode(MAIN_BUTTON_PIN, INPUT);
-  pinMode(GEAR_BUTTON_PIN, INPUT);
+  pinMode(PARK_SWITCH_PIN, INPUT_PULLUP);  // Park switch: HIGH=Drive, LOW=Park/Neutral (or wire break → Drive)
   pinMode(BRAKE_PIN, INPUT_PULLUP);  // NC switch: LOW=not pressed, HIGH=pressed (or wire break — fail-safe)
+
+  // Spare inputs — reserved, not yet read
+  pinMode(SPARE_INPUT_1, INPUT_PULLUP);
+  pinMode(SPARE_INPUT_2, INPUT_PULLUP);
+  pinMode(SPARE_INPUT_3, INPUT_PULLUP);
 
   // VSS interrupt setup
   #if SPEED_SOURCE == 2
