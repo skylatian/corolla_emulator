@@ -106,8 +106,11 @@
 // ============================================================================
 
 #define INTERVAL_20HZ    50000  // 50ms = 20 Hz
-#define DEBOUNCE_MS      200    // Lockout per press
 #define HEARTBEAT_MS     2000
+
+// SET/RES auto-repeat: after holding for REPEAT_DELAY_MS, repeat every REPEAT_INTERVAL_MS
+#define REPEAT_DELAY_MS     500   // Initial hold before repeating starts
+#define REPEAT_INTERVAL_MS  200   // Repeat rate once held (5 km/h per second)
 
 unsigned long lastMicros_20hz = 0;
 unsigned long lastMillis_hb   = 0;
@@ -120,7 +123,9 @@ MCP_CAN CAN(CAN_CS_PIN);
 
 bool mainOn = false;              // MAIN toggle state (flips on each MAIN press)
 uint8_t pendingEvent = BTN_NONE;  // Button event to send (cleared after one frame)
-unsigned long lastPressMs = 0;    // Debounce timestamp
+uint8_t lastButton = BTN_NONE;   // Previous loop's decoded button (for edge detection)
+unsigned long holdStartMs = 0;   // When the current button was first pressed
+unsigned long lastRepeatMs = 0;  // Last auto-repeat timestamp
 
 // C3/relay state
 bool c3Present = false;           // true when 0x2E4 seen within timeout
@@ -137,31 +142,31 @@ uint32_t txError = 0;
 // STALK READING
 // ============================================================================
 
-// Decode ADC value into button press. Returns BTN_NONE if no button or
-// if within debounce lockout. Only call when relay is energized (c3Present).
-uint8_t read_stalk() {
+// Decode ADC value into button. No state tracking — pure analog read.
+uint8_t decode_stalk_adc() {
   int adc = analogRead(STALK_PIN);
-  uint8_t btn = BTN_NONE;
 
-  if (adc >= STALK_SET_MIN && adc <= STALK_SET_MAX) {
-    btn = BTN_SET;
-  } else if (adc >= STALK_RES_MIN && adc <= STALK_RES_MAX) {
-    btn = BTN_RES;
-  } else if (adc >= STALK_CANCEL_MIN && adc <= STALK_CANCEL_MAX) {
-    btn = BTN_CANCEL;
-  } else if (adc >= STALK_MAIN_MIN && adc <= STALK_MAIN_MAX) {
-    btn = BTN_MAIN_TOGGLE;
-  }
+  if (adc >= STALK_SET_MIN && adc <= STALK_SET_MAX)       return BTN_SET;
+  if (adc >= STALK_RES_MIN && adc <= STALK_RES_MAX)       return BTN_RES;
+  if (adc >= STALK_CANCEL_MIN && adc <= STALK_CANCEL_MAX) return BTN_CANCEL;
+  if (adc >= STALK_MAIN_MIN && adc <= STALK_MAIN_MAX)     return BTN_MAIN_TOGGLE;
+  return BTN_NONE;
+}
 
-  // Debounce: ignore presses within lockout window
-  if (btn != BTN_NONE) {
-    unsigned long now = millis();
-    if (now - lastPressMs < DEBOUNCE_MS) {
-      return BTN_NONE;  // Still in lockout
-    }
-    lastPressMs = now;
+// Read stalk with edge detection + auto-repeat for SET/RES.
+// MAIN and CANCEL: fire once per press (edge-detected).
+// SET and RES: fire on initial press, then auto-repeat after hold delay.
+// Returns BTN_NONE if no event to send.
+uint8_t read_stalk() {
+  uint8_t btn = decode_stalk_adc();
+  unsigned long now = millis();
 
-    // MAIN is a toggle — flip state on each press
+  // --- New press (rising edge: NONE or different button → this button) ---
+  if (btn != BTN_NONE && btn != lastButton) {
+    lastButton = btn;
+    holdStartMs = now;
+    lastRepeatMs = now;
+
     if (btn == BTN_MAIN_TOGGLE) {
       mainOn = !mainOn;
       Serial.print(F("MAIN toggled: "));
@@ -174,9 +179,24 @@ uint8_t read_stalk() {
         case BTN_CANCEL: Serial.println(F("CANCEL")); break;
       }
     }
+    return btn;
   }
 
-  return btn;
+  // --- Button held (same button as last loop) ---
+  if (btn != BTN_NONE && btn == lastButton) {
+    // Only auto-repeat SET and RES
+    if ((btn == BTN_SET || btn == BTN_RES) &&
+        (now - holdStartMs >= REPEAT_DELAY_MS) &&
+        (now - lastRepeatMs >= REPEAT_INTERVAL_MS)) {
+      lastRepeatMs = now;
+      return btn;
+    }
+    return BTN_NONE;  // MAIN/CANCEL held or repeat not yet due
+  }
+
+  // --- Button released ---
+  lastButton = BTN_NONE;
+  return BTN_NONE;
 }
 
 // ============================================================================
