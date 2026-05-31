@@ -46,7 +46,7 @@
 // ============================================================================
 
 #define CAN_CS_PIN  17  // CANBed V1 onboard MCP2515 CS pin
-#define STALK_PIN   A0  // Analog input for stalk resistance
+#define STALK_PIN   A3  // Analog input for stalk resistance
 #define RELAY_PIN   4   // DPDT relay control: HIGH = stalk to Arduino, LOW = stalk to stock ECU
 
 // Blinker sense pins — INPUT_PULLUP, LOW = blinker active
@@ -79,17 +79,17 @@
 
 // note: these values are all with a ~470 ohm resistor (measured about 466)
 
-#define STALK_SET_MIN      535 // mid ~585
-#define STALK_SET_MAX      635
+#define STALK_SET_MIN      380 // mid ~430
+#define STALK_SET_MAX      490
 
-#define STALK_RES_MIN      295 // mid ~345
-#define STALK_RES_MAX      395
+#define STALK_RES_MIN      625 // mid ~675
+#define STALK_RES_MAX      925
 
-#define STALK_CANCEL_MIN   735 // mid ~785
-#define STALK_CANCEL_MAX   835
+#define STALK_CANCEL_MIN   185 // mid ~235
+#define STALK_CANCEL_MAX   295
 
-#define STALK_MAIN_MIN     0 // basically zero
-#define STALK_MAIN_MAX     50
+#define STALK_MAIN_MIN     900 // max
+#define STALK_MAIN_MAX     1023
 
 // ============================================================================
 // BUTTON EVENT CODES (byte 0 of CAN message)
