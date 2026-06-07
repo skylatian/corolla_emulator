@@ -33,6 +33,9 @@
 #define VSS_SAMPLE_MS      500   // Sampling window in ms
 #define CAN_CS_PIN         17    // CANBed V1 onboard MCP2515 CS pin
 
+// Set true to always report Drive regardless of switch state (testing override)
+#define FORCE_DRIVE        false
+
 // Gear selection switches — INPUT_PULLUP, LOW = active
 // Wire through voltage dividers from 12V car signals to 5V logic.
 // Assign actual pin numbers when wiring.
@@ -139,6 +142,9 @@ void send_gear_packet(uint8_t gear) {
 
 // Read gear switches and return DBC GEAR value
 uint8_t read_gear() {
+  #if FORCE_DRIVE
+    return 0;  // Always Drive (testing override)
+  #endif
   // Priority: Reverse > Park/Neutral > Drive
   if (digitalRead(GEAR_REV_PIN) == LOW) return 16;  // R
   if (digitalRead(GEAR_PN_PIN) == LOW) return 32;    // P
