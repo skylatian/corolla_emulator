@@ -21,13 +21,13 @@ MCP_CAN CAN(9);  // Seeed CAN Bus Shield v2: CS on D9 (not D10)
 // Set to false to have the emulator spoof them (bench testing without EPS/SAS).
 #define REAL_EPS_CONNECTED    true  // EPS provides 0x260 (STEER_TORQUE_SENSOR), 0x262 (EPS_STATUS)
 #define REAL_SAS_CONNECTED    true  // SAS provides 0x25 (STEER_ANGLE_SENSOR)
-#define REAL_PEDAL_CONNECTED  true  // Comma Pedal provides 0x201 (GAS_SENSOR) at 50 Hz
+#define REAL_PEDAL_CONNECTED  false  // Comma Pedal provides 0x201 (GAS_SENSOR) at 50 Hz
 
 // Messages the emulator can send. Defaults are what FrogPilot needs.
 #define SEND_ACC_CONTROL      false  // 0x343 — WARNING: triggers relay_malfunction if true!
 #define SEND_BRAKE_MODULE     true   // 0x224 — required by panda safety RX checks
 #define SEND_PCM_CRUISE_2     true   // 0x1D3 — MAIN_ON flag (cruise availability)
-#define SEND_GEAR_PACKET      false  // 0x3BC — gear position (moved to VSS speed device)
+#define SEND_GEAR_PACKET      true   // 0x3BC — gear position (fallback when VSS device absent)
 #define SEND_BODY_CONTROL     true   // 0x620 — doors/seatbelt state
 #define SEND_WHEEL_SPEEDS     true   // 0xAA  — required by panda safety RX checks (83 Hz)
 #define SEND_SPEED            true   // 0xB4  — vehicle speed (also EPS init message)
@@ -47,11 +47,14 @@ MCP_CAN CAN(9);  // Seeed CAN Bus Shield v2: CS on D9 (not D10)
 #define SPEED_DEVICE_TIMEOUT_MS   1000  // 1 second without 0xAA = device gone
 
 // External cruise stalk device auto-detection.
-// When true, the emulator listens for 0x69 on the CAN bus. If received within
-// timeout, stalk CAN input drives the cruise state machine instead of digital buttons.
-// When false (or device absent), digital buttons on pins 3/4 control cruise.
-#define AUTO_DETECT_STALK_DEVICE  true
-#define STALK_DEVICE_TIMEOUT_MS   1000  // 1 second without 0x69 = device gone
+// When true, the emulator auto-detects the stalk device: uses CAN stalk when
+// 0x69 frames arrive, falls back to digital buttons if absent or lost.
+// When false, always uses CAN stalk input — no button fallback, no timeout.
+#define AUTO_DETECT_STALK_DEVICE  false
+#define STALK_DEVICE_TIMEOUT_MS   1000  // 1 second without 0x69 = device gone (auto-detect only)
+
+// Set true to always report brake NOT pressed regardless of switch state (testing override)
+#define FORCE_BRAKE_OFF        true
 
 // Send the bulk "background" messages from the original emulator (0x367, 0x394, etc.)
 // These fill out the CAN bus to look more like a real car. Required for OP to fingerprint the car, at least in its current state
@@ -104,7 +107,7 @@ MCP_CAN CAN(9);  // Seeed CAN Bus Shield v2: CS on D9 (not D10)
 #define INTERVAL_25HZ   40000   // 25 Hz (40 ms) — EPS_STATUS
 #define INTERVAL_10HZ   100000  // 10 Hz — background msgs
 #define INTERVAL_3HZ    333333  // ~3 Hz — BODY_CONTROL_STATE
-// INTERVAL_1HZ removed — GEAR_PACKET moved to VSS speed device
+#define INTERVAL_1HZ    1000000 // 1 Hz — GEAR_PACKET (fallback)
 
 unsigned long lastMicros_83hz = 0;
 unsigned long lastMicros_50hz = 0;
@@ -113,7 +116,7 @@ unsigned long lastMicros_33hz = 0;
 unsigned long lastMicros_25hz = 0;
 unsigned long lastMicros_10hz = 0;
 unsigned long lastMicros_3hz  = 0;
-// lastMicros_1hz removed — GEAR_PACKET moved to VSS speed device
+unsigned long lastMicros_1hz  = 0;
 unsigned long lastMillis_hb   = 0;  // heartbeat
 #define HEARTBEAT_MS 2000
 
@@ -130,7 +133,7 @@ unsigned long lastMillis_hb   = 0;  // heartbeat
 uint8_t cruiseState = CRUISE_MAIN_ON;  // Start with MAIN on (matches old default)
 bool cruiseEngaged = false;    // CRUISE_ACTIVE in 0x1D2 (derived from state)
 bool cruiseMain = true;        // MAIN_ON in 0x1D3 (derived from state)
-// Gear state moved to VSS speed device (sends 0x3BC)
+bool gearInDrive = true;       // true = Drive, false = Park (fallback when VSS device absent)
 bool brakePressed = false;     // Brake pedal state from NC switch (fail-safe: true on wire break)
 uint8_t cruiseSetSpeed = 0;    // Captured speed at SET moment (km/h)
 uint8_t msg_counter_1d2 = 0;  // Unused — kept for future rolling counter if needed
@@ -172,22 +175,21 @@ unsigned long lastCanSpeedMs = 0;   // millis() of last 0xAA received
 bool speedDevicePresent = false;    // true when 0xAA seen within timeout
 #endif
 
-// CAN-received stalk input from external cruise stalk device (auto-detect)
-#if AUTO_DETECT_STALK_DEVICE
 // Stalk button event codes (must match cruise_stalk.ino)
+// Used by both CAN stalk input and digital button fallback
 #define STALK_BTN_NONE         0
 #define STALK_BTN_SET          1
 #define STALK_BTN_RES          2
 #define STALK_BTN_CANCEL       3
 #define STALK_BTN_MAIN_TOGGLE  4
 
+// CAN-received stalk input from external cruise stalk device
 uint8_t stalkButtonEvent = STALK_BTN_NONE;  // Latest button event from stalk
 bool stalkMainOn = false;                    // MAIN state from stalk device
 unsigned long lastStalkMs = 0;               // millis() of last 0x69 received
 bool stalkDevicePresent = false;             // true when 0x69 seen within timeout
 bool stalkMainChanged = false;               // true when stalkMainOn changes between frames
 bool prevStalkMainOn = false;                // previous frame's MAIN state for edge detection
-#endif
 
 // Read incoming CAN messages. Non-blocking — drains all available frames from
 // the MCP2515 RX buffers (2 deep) to prevent overflow. Handles:
@@ -217,7 +219,6 @@ void check_can_receive() {
     }
     #endif
 
-    #if AUTO_DETECT_STALK_DEVICE
     if (rxId == 0x69 && rxLen >= 3) {
       // Validate toyota_checksum (byte 2) — reject corrupted frames
       if (rxBuf[2] != toyota_checksum(0x69, rxBuf, 3)) continue;
@@ -256,7 +257,6 @@ void check_can_receive() {
         Serial.println(stalkMainOn ? "ON" : "OFF");
       }
     }
-    #endif
   }
 
   // Timeouts
@@ -343,7 +343,7 @@ void print_heartbeat() {
   Serial.print("  State:  "); Serial.println(stateNames[cruiseState]);
   Serial.print("  Cruise: "); Serial.println(cruiseEngaged ? "ENGAGED" : "off");
   Serial.print("  Main:   "); Serial.println(cruiseMain    ? "ON"       : "off");
-  Serial.print("  Gear:   VSS device");
+  Serial.print("  Gear:   "); Serial.println(gearInDrive   ? "Drive"    : "Park");
   Serial.print("  Brake:  "); Serial.println(brakePressed  ? "PRESSED"  : "off");
   Serial.print("  Speed:  "); Serial.println(spd);
   Serial.print("  SetSpd: "); Serial.print(cruiseSetSpeed); Serial.println(" km/h");
@@ -430,7 +430,16 @@ void send_brake_module() {
   sendMsg(0x224, data, 8);
 }
 
-// 0x3BC — GEAR_PACKET: moved to VSS speed device
+// 0x3BC — GEAR_PACKET (8 bytes, no checksum in DBC)
+// Byte 1: gear position. 0x00 = Drive, 0x20 = not-in-drive (Park/Neutral)
+// Only sent as fallback when VSS speed device is absent.
+void send_gear_packet(bool in_drive) {
+  uint8_t data[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  if (!in_drive) {
+    data[1] = 0x20;  // Not in drive
+  }
+  sendMsg(0x3BC, data, 8);
+}
 
 // 0x620 — BODY_CONTROL_STATE (8 bytes, no checksum in DBC)
 // Doors closed, seatbelt on — all zeros is safe defaults
@@ -726,9 +735,12 @@ void process_cruise_event(uint8_t event, bool main_on) {
 void check_buttons() {
   unsigned long now = millis();
 
+  // --- CAN stalk input ---
+  // When AUTO_DETECT_STALK_DEVICE=false: always process CAN stalk (no fallback)
+  // When AUTO_DETECT_STALK_DEVICE=true: only process when stalk device is present
   #if AUTO_DETECT_STALK_DEVICE
-  // --- CAN stalk input (priority when stalk device is present) ---
   if (stalkDevicePresent) {
+  #endif
     // Process button events (SET, RES, CANCEL, MAIN_TOGGLE)
     if (stalkButtonEvent != STALK_BTN_NONE) {
       process_cruise_event(stalkButtonEvent, stalkMainOn);
@@ -747,14 +759,13 @@ void check_buttons() {
         process_cruise_event(STALK_BTN_MAIN_TOGGLE, stalkMainOn);
       }
     }
+  #if AUTO_DETECT_STALK_DEVICE
   }
   #endif
 
-  // --- Digital button fallback (when no stalk device) ---
+  // --- Digital button fallback (auto-detect only, when stalk device absent) ---
   #if AUTO_DETECT_STALK_DEVICE
   if (!stalkDevicePresent) {
-  #endif
-
     // SET button
     if (digitalRead(SET_BUTTON_PIN) == HIGH && (now - lastDebounce_set) > DEBOUNCE_MS) {
       lastDebounce_set = now;
@@ -779,12 +790,10 @@ void check_buttons() {
       bool newMain = (cruiseState == CRUISE_OFF);
       process_cruise_event(STALK_BTN_MAIN_TOGGLE, newMain);
     }
-
-  #if AUTO_DETECT_STALK_DEVICE
   }
   #endif
 
-  // Gear: handled by VSS speed device (sends 0x3BC)
+  // Gear: always Drive when testing without VSS device (no local switch)
 }
 
 // ============================================================================
@@ -801,7 +810,7 @@ void setup() {
   pinMode(RES_BUTTON_PIN, INPUT);
   pinMode(CANCEL_BUTTON_PIN, INPUT);
   pinMode(MAIN_BUTTON_PIN, INPUT);
-  // Park switch removed — gear handled by VSS speed device
+  // Gear defaults to Drive (gearInDrive=true). No local switch — VSS device handles gear when present.
   pinMode(BRAKE_PIN, INPUT_PULLUP);  // NC switch: LOW=not pressed, HIGH=pressed (or wire break — fail-safe)
 
   // Spare inputs — reserved, not yet read
@@ -877,7 +886,11 @@ void loop() {
 
   // Brake pedal: read every loop iteration (safety-critical, no debounce)
   // NC switch with INPUT_PULLUP: HIGH = pressed (or wire break — fail-safe), LOW = not pressed
-  brakePressed = (digitalRead(BRAKE_PIN) == HIGH);
+  #if FORCE_BRAKE_OFF
+    brakePressed = false;
+  #else
+    brakePressed = (digitalRead(BRAKE_PIN) == HIGH);
+  #endif
 
   // --- 83 Hz tier: WHEEL_SPEEDS, STEER_ANGLE_SENSOR ---
   // STEER_ANGLE_SENSOR needs 80 Hz per carstate parser
@@ -984,7 +997,18 @@ void loop() {
     #endif
   }
 
-  // 1 Hz tier removed — GEAR_PACKET moved to VSS speed device
+  // --- 1 Hz tier: GEAR_PACKET (fallback when VSS device absent) ---
+  if (now - lastMicros_1hz >= INTERVAL_1HZ) {
+    lastMicros_1hz = now;
+
+    #if SEND_GEAR_PACKET
+      #if AUTO_DETECT_SPEED_DEVICE
+        if (!speedDevicePresent) send_gear_packet(gearInDrive);
+      #else
+        send_gear_packet(gearInDrive);
+      #endif
+    #endif
+  }
 
   // --- CAN receive: auto-detect external devices (VSS speed, cruise stalk) ---
   check_can_receive();

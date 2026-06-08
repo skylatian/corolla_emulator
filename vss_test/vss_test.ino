@@ -3,7 +3,7 @@
 // Open serial monitor at 115200, drive at known GPS speed, note pulses/sec
 // Press ENTER to snapshot the last 3 seconds of readings
 
-#define VSS_PIN 7
+#define VSS_PIN 4
 
 volatile unsigned long pulseCount = 0;
 

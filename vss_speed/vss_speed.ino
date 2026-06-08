@@ -34,7 +34,7 @@
 #define CAN_CS_PIN         17    // CANBed V1 onboard MCP2515 CS pin
 
 // Set true to always report Drive regardless of switch state (testing override)
-#define FORCE_DRIVE        false
+#define FORCE_DRIVE        true
 
 // Gear selection switches — INPUT_PULLUP, LOW = active
 // Wire through voltage dividers from 12V car signals to 5V logic.

@@ -58,6 +58,9 @@
 // CAN message ID for stalk data (not used by any Toyota DBC message)
 #define STALK_CAN_ID  0x69
 
+// Set true to force relay ON (stalk to Arduino) regardless of C3 detection (testing override)
+#define FORCE_RELAY_ON  true
+
 // CAN message ID to detect openpilot onroad (only OP sends this via panda)
 #define C3_DETECT_ID  0x2E4
 
@@ -260,6 +263,17 @@ uint8_t read_blinkers() {
 // ============================================================================
 
 void check_can_receive() {
+  #if FORCE_RELAY_ON
+    // Still drain RX buffers to prevent overflow, but ignore C3 detection
+    while (CAN.checkReceive() == CAN_MSGAVAIL) {
+      unsigned long rxId;
+      uint8_t rxLen;
+      uint8_t rxBuf[8];
+      CAN.readMsgBuf(&rxId, &rxLen, rxBuf);
+    }
+    return;
+  #endif
+
   unsigned long nowMs = millis();
 
   // Drain all available frames from MCP2515 RX buffers
@@ -304,9 +318,14 @@ void setup() {
   Serial.begin(115200);
   Serial.println(F("Cruise Stalk Device starting..."));
 
-  // Relay pin — start de-energized (NC = stalk to stock ECU)
+  // Relay pin
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW);
+  #if FORCE_RELAY_ON
+    digitalWrite(RELAY_PIN, HIGH);  // Force relay ON (testing override)
+    c3Present = true;
+  #else
+    digitalWrite(RELAY_PIN, LOW);   // Start de-energized (NC = stalk to stock ECU)
+  #endif
 
   // Blinker sense pins
   pinMode(BLINKER_LEFT_PIN, INPUT_PULLUP);
