@@ -105,9 +105,9 @@ unsigned long lastMillis_hb   = 0;  // heartbeat
 #define CRUISE_ENGAGED    2  // Cruise actively controlling speed
 #define CRUISE_CANCELLED  3  // Cruise cancelled, speed preserved for resume
 
-uint8_t cruiseState = CRUISE_MAIN_ON;  // Start with MAIN on (matches old default)
+uint8_t cruiseState = CRUISE_OFF;  // Always start OFF — stalk device sets MAIN on first 0x69
 bool cruiseEngaged = false;    // CRUISE_ACTIVE in 0x1D2 (derived from state)
-bool cruiseMain = true;        // MAIN_ON in 0x1D3 (derived from state)
+bool cruiseMain = false;       // MAIN_ON in 0x1D3 (derived from state)
 bool gearInDrive = true;       // true = Drive, false = Park (fallback when VSS device absent)
 bool brakePressed = false;     // Brake pedal state from NC switch (fail-safe: true on wire break)
 uint8_t cruiseSetSpeed = 0;    // Captured speed at SET moment (km/h)
