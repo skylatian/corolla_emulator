@@ -10,7 +10,7 @@ Originally based on [wocsor's corolla_emulator](https://github.com/wocsor/coroll
 |--------|-------|------|
 | **Emulator** | Arduino Uno + Seeed CAN Shield v2 (CS=D9) | Sends all spoofed ECU messages (0xAA, 0xB4, 0x1D2, 0x1D3, etc.) |
 | **VSS Speed** | Longan CANBed V1 (CS=D17) | Reads vehicle speed sensor pulses, sends 0xAA + 0xB4 |
-| **Cruise Stalk** | Longan CANBed V1 (CS=D17) | Reads Toyota cruise stalk resistance on A0, sends 0x69 |
+| **Cruise Stalk** | Longan CANBed V1 (CS=D17) | Reads Toyota cruise stalk resistance on A0, sends 0x69; detects C3/onroad by filtered 0x2E4 RX |
 
 All devices share a single 500 kbps CAN bus with the EPS, SAS, Comma Pedal, and Comma 3 (via 2x Ocelot).
 
@@ -66,6 +66,28 @@ CAN messages affected:
 
 Button events are pulse-style: non-NONE for one frame, then NONE. MAIN state (byte 1) is sent on every frame, allowing the emulator to recover from lost event frames.
 
+## Cruise Stalk C3 Detection
+
+The cruise stalk device uses `0x2E4` (`STEERING_LKA`) as the C3/onroad signal. That message is
+sent by openpilot through panda while onroad, and disappears when OP goes offroad or panda TX is
+blocked.
+
+The stalk CANBed V1 uses MCP2515 hardware masks/filters to accept only standard ID `0x2E4`.
+This is required because the MCP2515 only has two RX buffers; accepting all traffic on the busy
+retrofit bus can drop `0x2E4` before the sketch drains it.
+
+Library details for the Longan/Seeed `mcp_can` library:
+
+- Use `CAN.begin(MCP_STDEXT, CAN_500KBPS, MCP_16MHZ)`.
+- Do not use `MCP_ANY` for this sketch; it disables masks/filters by configuring RX buffers to
+  accept all messages.
+- Do not use `MCP_STD`; that mode is commented out in the library and fails initialization.
+- Standard 11-bit filter encoding is `id << 16`; exact-match mask for all standard ID bits is
+  `0x07FF0000`.
+
+The sketch also performs software validation (`rxId == 0x2E4`, length `5`) and prints `2E4/s`
+in its serial heartbeat.
+
 ## Digital Button Fallback (bench testing)
 
 When no stalk device is detected, physical buttons on the emulator work:
@@ -112,3 +134,7 @@ When `AUTO_DETECT_SPEED_DEVICE` is true, CAN speed from the VSS device overrides
 - **CANBed V1 sketches**: `mcp_can.h` from Longan Labs — same API, different underlying lib. Both are installed; Arduino resolves by board.
 
 Both use `MCP_16MHZ` (16 MHz crystal) and `MCP_NORMAL` mode.
+
+Cruise stalk exception: initialize with `MCP_STDEXT` so the 0x2E4 hardware filters remain
+enabled. `MCP_ANY` is fine for simple send/receive test sketches but is not safe for filtered
+C3 detection.

@@ -74,7 +74,6 @@
 
 // ============================================================================
 // RESISTANCE THRESHOLDS (ADC values, 0-1023)
-// Placeholder values — measure actual stalk resistances and tune these.
 // Each button produces a different resistance on the same 2-wire circuit.
 // Wire a voltage divider: 5V → 10k pullup → A0 → stalk → GND.
 // Then read ADC values for each button position.
@@ -133,6 +132,8 @@ unsigned long lastRepeatMs = 0;  // Last auto-repeat timestamp
 // C3/relay state
 bool c3Present = false;           // true when 0x2E4 seen within timeout
 unsigned long lastC3Ms = 0;       // millis() of last 0x2E4 received
+uint32_t c3RxCount = 0;           // 0x2E4 frames received since boot (debug)
+uint32_t c3RxCountLastHb = 0;     // snapshot for per-heartbeat rate
 
 // Blinker state: DBC TURN_SIGNALS value (1=left, 2=right, 3=none)
 uint8_t turnSignals = 3;  // default: none
@@ -262,6 +263,33 @@ uint8_t read_blinkers() {
 // CAN RECEIVE — detect C3 presence via 0x2E4
 // ============================================================================
 
+// MCP2515 has only 2 RX hardware buffers. With MCP_ANY the bus flood from the
+// emulator, EPS, and VSS device can fill both slots between loop() calls, so
+// 0x2E4 frames get dropped before software ever reads them. Hardware filters
+// discard everything except 0x2E4 at the controller — RX buffers stay free.
+//
+// Filter encoding (Longan/Seeed mcp_can library): standard 11-bit ID << 16.
+// Mask 0x07FF0000 = match all ID bits exactly. Filter 0x02E40000 = ID 0x2E4.
+#define C3_RX_MASK   0x07FF0000UL
+#define C3_RX_FILTER ((unsigned long)C3_DETECT_ID << 16)
+
+bool setup_c3_rx_filter() {
+  // Must run after setMode(MCP_NORMAL) — init_Mask returns to mcpMode, and begin()
+  // leaves mcpMode as LOOPBACK which fails on a live bus.
+  if (CAN.init_Mask(0, 0, C3_RX_MASK) != MCP2515_OK ||
+      CAN.init_Filt(0, 0, C3_RX_FILTER) != MCP2515_OK ||
+      CAN.init_Filt(1, 0, C3_RX_FILTER) != MCP2515_OK ||
+      CAN.init_Mask(1, 0, C3_RX_MASK) != MCP2515_OK ||
+      CAN.init_Filt(2, 0, C3_RX_FILTER) != MCP2515_OK ||
+      CAN.init_Filt(3, 0, C3_RX_FILTER) != MCP2515_OK ||
+      CAN.init_Filt(4, 0, C3_RX_FILTER) != MCP2515_OK ||
+      CAN.init_Filt(5, 0, C3_RX_FILTER) != MCP2515_OK) {
+    Serial.println(F("CAN filter setup failed"));
+    return false;
+  }
+  return true;
+}
+
 void check_can_receive() {
   #if FORCE_RELAY_ON
     // Still drain RX buffers to prevent overflow, but ignore C3 detection
@@ -276,21 +304,25 @@ void check_can_receive() {
 
   unsigned long nowMs = millis();
 
-  // Drain all available frames from MCP2515 RX buffers
+  // Hardware filter guarantees every received frame is 0x2E4
   while (CAN.checkReceive() == CAN_MSGAVAIL) {
     unsigned long rxId;
     uint8_t rxLen;
     uint8_t rxBuf[8];
     CAN.readMsgBuf(&rxId, &rxLen, rxBuf);
 
-    if (rxId == C3_DETECT_ID) {
-      lastC3Ms = nowMs;
+    // Belt-and-suspenders: verify ID and expected STEERING_LKA length (5 bytes)
+    if (rxId != C3_DETECT_ID || rxLen != 5) {
+      continue;
+    }
 
-      if (!c3Present) {
-        c3Present = true;
-        digitalWrite(RELAY_PIN, HIGH);  // Route stalk to Arduino
-        Serial.println(F("C3 DETECTED (0x2E4) — relay ON, stalk to Arduino"));
-      }
+    c3RxCount++;
+    lastC3Ms = nowMs;
+
+    if (!c3Present) {
+      c3Present = true;
+      digitalWrite(RELAY_PIN, HIGH);  // Route stalk to Arduino
+      Serial.println(F("C3 DETECTED (0x2E4) — relay ON, stalk to Arduino"));
     }
   }
 
@@ -343,13 +375,28 @@ void setup() {
   Serial.print(C3_TIMEOUT_MS);
   Serial.println(F("ms"));
 
-  // Init onboard MCP2515
-  while (CAN.begin(MCP_ANY, CAN_500KBPS, MCP_16MHZ) != CAN_OK) {
-    Serial.println(F("CAN init failed, retrying..."));
-    delay(500);
+  // Use MCP_STDEXT so MCP2515 masks/filters stay enabled. MCP_ANY disables
+  // hardware filtering, and MCP_STD is broken/commented out in this library.
+  //
+  // begin() configures baud rate then tries to enter loopback mode before returning.
+  // On a live bus that loopback step can fail ("Returning to Previous Mode Failure")
+  // even though config/baud succeeded, so continue to an explicit NORMAL mode check.
+  byte beginResult = CAN.begin(MCP_STDEXT, CAN_500KBPS, MCP_16MHZ);
+  if (beginResult != CAN_OK) {
+    Serial.print(F("CAN begin warning/result: "));
+    Serial.println(beginResult);
   }
-  CAN.setMode(MCP_NORMAL);
-  Serial.println(F("CAN BUS init ok — sending 0x69 at 20 Hz"));
+
+  // Switch to normal mode BEFORE filter setup so init_Mask returns here, not loopback.
+  if (CAN.setMode(MCP_NORMAL) != MCP2515_OK) {
+    Serial.println(F("CAN setMode(NORMAL) failed — check MCP2515 wiring/SPI"));
+    while (true) { delay(1000); }
+  }
+  if (!setup_c3_rx_filter()) {
+    Serial.println(F("Halting: 0x2E4 hardware filter is required for robust C3 detection"));
+    while (true) { delay(1000); }
+  }
+  Serial.println(F("CAN BUS init ok — RX filter 0x2E4 only, sending 0x69 at 20 Hz"));
 }
 
 // ============================================================================
@@ -389,6 +436,9 @@ void loop() {
     Serial.print(mainOn ? "ON" : "OFF");
     Serial.print(F("  C3: "));
     Serial.print(c3Present ? "ON" : "off");
+    Serial.print(F("  2E4/s: "));
+    Serial.print((c3RxCount - c3RxCountLastHb) / 2);  // heartbeat every 2s
+    c3RxCountLastHb = c3RxCount;
     if (c3Present) {
       Serial.print(F("  ADC: "));
       Serial.print(analogRead(STALK_PIN));
