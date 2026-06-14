@@ -37,21 +37,21 @@ MCP_CAN CAN(9);  // Seeed CAN Bus Shield v2: CS on D9 (not D10)
 #define SEND_PRE_COLLISION    true   // 0x283 — required by carstate for non-TSS2 without DSU
 #define SEND_VSC1S07          true   // 0x320 — vehicle stability control (20 Hz required)
 
-// External VSS speed device auto-detection.
-// When true, the emulator listens for 0xAA on the CAN bus. If it receives one
-// within the timeout, it uses that speed and stops sending its own 0xAA/0xB4.
-// If the device disappears (no 0xAA for SPEED_DEVICE_TIMEOUT_MS), the emulator
-// falls back to sending 0xAA/0xB4 with speed=0.
-// When false, the emulator always sends its own 0xAA/0xB4 from SPEED_SOURCE.
-#define AUTO_DETECT_SPEED_DEVICE  true // you should only use this for debugging on the bench! should be set to false for use in car
-#define SPEED_DEVICE_TIMEOUT_MS   1000  // 1 second without 0xAA = device gone
+// External VSS speed device.
+// When true (production): the external VSS device owns speed (0xAA/0xB4) and gear
+// (0x3BC). The emulator NEVER sends them — it only listens to 0xAA to capture the
+// cruise set-speed and for heartbeat display. If the VSS device goes silent, 0xAA
+// stops, openpilot sees a CAN timeout and disengages (fail-safe).
+// When false (bench, no VSS device): the emulator reads speed from the serial
+// monitor (type mph + enter) and sends 0xAA/0xB4/0x3BC itself.
+#define VSS_DEVICE_INSTALLED      true
+#define SPEED_DEVICE_TIMEOUT_MS   1000  // 1 second without 0xAA = device gone (heartbeat display)
 
-// External cruise stalk device auto-detection.
-// When true, the emulator auto-detects the stalk device: uses CAN stalk when
-// 0x69 frames arrive, falls back to digital buttons if absent or lost.
-// When false, always uses CAN stalk input — no button fallback, no timeout.
-#define AUTO_DETECT_STALK_DEVICE  false
-#define STALK_DEVICE_TIMEOUT_MS   1000  // 1 second without 0x69 = device gone (auto-detect only)
+// External cruise stalk device (0x69). The emulator always expects the CAN stalk —
+// there is no digital-button fallback. If the stalk device goes silent for
+// STALK_DEVICE_TIMEOUT_MS while cruise is ENGAGED, cruise auto-cancels for safety
+// (set speed preserved for resume on reconnect).
+#define STALK_DEVICE_TIMEOUT_MS   1000  // 1 second without 0x69 = stalk device gone
 
 // Set true to always report brake NOT pressed regardless of switch state (testing override)
 #define FORCE_BRAKE_OFF        true
@@ -64,36 +64,11 @@ MCP_CAN CAN(9);  // Seeed CAN Bus Shield v2: CS on D9 (not D10)
 // PIN ASSIGNMENTS
 // ============================================================================
 
-#define SET_BUTTON_PIN     3   // SET: engage cruise / decrement set speed
-#define RES_BUTTON_PIN     4   // RES: resume cruise / increment set speed
-#define CANCEL_BUTTON_PIN  5   // CANCEL: disengage cruise (set speed preserved)
-#define MAIN_BUTTON_PIN    6   // MAIN: toggle cruise main on/off
-// D8: freed up — was park switch, now handled by VSS speed device
-#define SPEED_POT_PIN      A0  // Potentiometer for wheel/vehicle speed (SPEED_SOURCE 1)
+// The brake pedal switch is the emulator's ONLY physical input. Everything else
+// (cruise stalk, speed, gear) arrives over CAN from dedicated devices.
 #define BRAKE_PIN          A1  // Brake pedal switch (NC pair: closed=not pressed, open=pressed)
                                // Uses INPUT_PULLUP — wire break reads as "pressed" (fail-safe)
-
-// Spare inputs — reserved for future signals. Wire to screw terminals on PCB.
-// All set to INPUT_PULLUP by default; change per-signal when wired.
-// NOTE: D2 is taken by MCP2515 INT (CAN shield), D7 by VSS (when SPEED_SOURCE==2)
-#define SPARE_INPUT_1  A2  // Digital-capable (spare)
-#define SPARE_INPUT_2  A3  // Digital-capable (e.g., brake NO pair for dual-channel)
-#define SPARE_INPUT_3  A4  // Digital-capable (future sensor)
-
-// Speed source: 0 = serial (type mph + enter), 1 = analog pot, 2 = VSS pulse counter
-#define SPEED_SOURCE       0
-
-// VSS (Vehicle Speed Sensor) configuration — only used when SPEED_SOURCE == 2
-// Wire VSS signal to this pin (must support hardware interrupts).
-// Pin 7 works on Pro Micro (ATmega32U4). On Uno, use pin 2 or 3.
-#define VSS_PIN            7
-// Calibration: pulses per kilometer. Measured empirically — do NOT calculate from gear ratios.
-// Baseline: ~13.85 pulses/sec at 10 mph (16.09 km/h) → ~3098 pulses/km
-// Refine by measuring at multiple speeds over longer distances.
-#define VSS_PULSES_PER_KM  3098
-// Sampling window in ms. Longer = smoother but more latency.
-// 500ms gives ~3.5 pulses at 5 mph (acceptable) and ~7 at 10 mph (good).
-#define VSS_SAMPLE_MS      500
+// Freed pins: D3-D6 (cruise buttons), A0 (speed pot), A2-A4 (spare inputs), D7 (VSS pulse), D8.
 
 // ============================================================================
 // TIMING (micros-based, non-blocking)
@@ -139,44 +114,26 @@ uint8_t cruiseSetSpeed = 0;    // Captured speed at SET moment (km/h)
 uint8_t msg_counter_1d2 = 0;  // Unused — kept for future rolling counter if needed
 uint8_t msg_counter_201 = 0;  // Counter for 0x201 (GAS_SENSOR, 4-bit rolling)
 
-// Button debounce
-unsigned long lastDebounce_set    = 0;
-unsigned long lastDebounce_res    = 0;
-unsigned long lastDebounce_cancel = 0;
-unsigned long lastDebounce_main   = 0;
-#define DEBOUNCE_MS 300
-
 // TX error tracking
 uint32_t txOk    = 0;
 uint32_t txError = 0;
 
-// Serial-controlled speed (SPEED_SOURCE 0)
-// Type a number in mph into the serial monitor and hit enter
+// Serial-controlled speed — only used in bench mode (no external VSS device).
+// Type a number in mph into the serial monitor and hit enter.
+#if !VSS_DEVICE_INSTALLED
 uint16_t serialSpeedKmh100 = 0;
 char serialBuf[16];
 uint8_t serialBufIdx = 0;
-
-// VSS pulse counting (SPEED_SOURCE 2)
-#if SPEED_SOURCE == 2
-volatile unsigned long vssPulseCount = 0;
-unsigned long vssLastSampleMs = 0;
-unsigned long vssLastCount = 0;
-uint16_t vssSpeedKmh100 = 0;  // speed in km/h * 100
-
-void vssISR() {
-  vssPulseCount++;
-}
 #endif
 
-// CAN-received speed from external VSS device (auto-detect)
-#if AUTO_DETECT_SPEED_DEVICE
+// CAN-received speed from the external VSS device (0xAA on bus)
+#if VSS_DEVICE_INSTALLED
 uint16_t canSpeedKmh100 = 0;       // speed in km/h * 100, read from 0xAA on bus
 unsigned long lastCanSpeedMs = 0;   // millis() of last 0xAA received
 bool speedDevicePresent = false;    // true when 0xAA seen within timeout
 #endif
 
 // Stalk button event codes (must match cruise_stalk.ino)
-// Used by both CAN stalk input and digital button fallback
 #define STALK_BTN_NONE         0
 #define STALK_BTN_SET          1
 #define STALK_BTN_RES          2
@@ -206,7 +163,7 @@ void check_can_receive() {
     uint8_t rxBuf[8];
     CAN.readMsgBuf(&rxId, &rxLen, rxBuf);
 
-    #if AUTO_DETECT_SPEED_DEVICE
+    #if VSS_DEVICE_INSTALLED
     if (rxId == 0xAA && rxLen >= 2) {
       uint16_t raw = ((uint16_t)rxBuf[0] << 8) | rxBuf[1];
       canSpeedKmh100 = (raw >= 6767) ? (raw - 6767) : 0;
@@ -234,7 +191,7 @@ void check_can_receive() {
       // the next NONE frame still carries the correct MAIN state.
       bool newMainOn = (rxBuf[1] != 0);
       if (newMainOn != prevStalkMainOn) {
-        stalkMainChanged = true;  // Edge detected — process in check_buttons()
+        stalkMainChanged = true;  // Edge detected — process in handle_stalk_input()
       }
       prevStalkMainOn = newMainOn;
       stalkMainOn = newMainOn;
@@ -260,32 +217,30 @@ void check_can_receive() {
   }
 
   // Timeouts
-  #if AUTO_DETECT_SPEED_DEVICE
+  #if VSS_DEVICE_INSTALLED
   if (speedDevicePresent && (nowMs - lastCanSpeedMs) >= SPEED_DEVICE_TIMEOUT_MS) {
     speedDevicePresent = false;
     canSpeedKmh100 = 0;
-    Serial.println(F("VSS device LOST — falling back to local speed"));
+    Serial.println(F("VSS device LOST — openpilot will time out 0xAA and disengage"));
   }
   #endif
 
-  #if AUTO_DETECT_STALK_DEVICE
+  // Stalk device loss — safety auto-cancel (always active; the stalk is the only
+  // cruise input). If 0x69 stops while ENGAGED, the driver has no way to disengage,
+  // so cancel cruise. Transition to CANCELLED (not OFF) so MAIN stays on and the set
+  // speed is preserved — the driver can reconnect the stalk and resume.
   if (stalkDevicePresent && (nowMs - lastStalkMs) >= STALK_DEVICE_TIMEOUT_MS) {
     stalkDevicePresent = false;
     stalkButtonEvent = STALK_BTN_NONE;
     stalkMainChanged = false;
-    // Safety: cancel cruise on stalk device loss.
-    // Without the stalk, the driver has no physical control to disengage.
-    // Transition to CANCELLED (not OFF) so MAIN stays on and speed is
-    // preserved — driver can reconnect stalk and resume.
     if (cruiseState == CRUISE_ENGAGED) {
       cruiseState = CRUISE_CANCELLED;
       update_cruise_outputs();
       Serial.println(F("Stalk device LOST — cruise CANCELLED for safety"));
     } else {
-      Serial.println(F("Stalk device LOST — falling back to digital buttons"));
+      Serial.println(F("Stalk device LOST"));
     }
   }
-  #endif
 }
 
 // ============================================================================
@@ -330,10 +285,8 @@ void print_heartbeat() {
   if (now - lastMillis_hb < HEARTBEAT_MS) return;
   lastMillis_hb = now;
 
-  #if SPEED_SOURCE == 1
-    uint16_t spd = analogRead(SPEED_POT_PIN) * 18;
-  #elif SPEED_SOURCE == 2
-    uint16_t spd = vssSpeedKmh100;
+  #if VSS_DEVICE_INSTALLED
+    uint16_t spd = canSpeedKmh100;
   #else
     uint16_t spd = serialSpeedKmh100;
   #endif
@@ -347,13 +300,11 @@ void print_heartbeat() {
   Serial.print("  Brake:  "); Serial.println(brakePressed  ? "PRESSED"  : "off");
   Serial.print("  Speed:  "); Serial.println(spd);
   Serial.print("  SetSpd: "); Serial.print(cruiseSetSpeed); Serial.println(" km/h");
-  #if AUTO_DETECT_SPEED_DEVICE
+  #if VSS_DEVICE_INSTALLED
   Serial.print("  VSSdev: "); Serial.println(speedDevicePresent ? "PRESENT" : "absent");
   Serial.print("  CAN spd:"); Serial.println(canSpeedKmh100);
   #endif
-  #if AUTO_DETECT_STALK_DEVICE
   Serial.print("  Stalk:  "); Serial.println(stalkDevicePresent ? "PRESENT" : "absent");
-  #endif
   Serial.print("  TX ok:  "); Serial.println(txOk);
   Serial.print("  TX err: "); Serial.println(txError);
   Serial.println("--------------");
@@ -605,10 +556,11 @@ void send_background_msgs() {
 }
 
 // ============================================================================
-// SERIAL SPEED INPUT
+// SERIAL SPEED INPUT (bench only — when no external VSS device)
 // Type a speed in mph and press enter. E.g., "25" → 25 mph → ~40 km/h
 // ============================================================================
 
+#if !VSS_DEVICE_INSTALLED
 void check_serial() {
   while (Serial.available()) {
     char c = Serial.read();
@@ -629,6 +581,7 @@ void check_serial() {
     }
   }
 }
+#endif  // !VSS_DEVICE_INSTALLED
 
 // ============================================================================
 // CRUISE STATE MACHINE
@@ -636,15 +589,9 @@ void check_serial() {
 
 // Get current speed in km/h (integer) from the best available source
 uint8_t get_current_speed_kmh() {
-  #if AUTO_DETECT_SPEED_DEVICE
-    if (speedDevicePresent) {
-      return (uint8_t)(canSpeedKmh100 / 100);
-    }
-  #endif
-  #if SPEED_SOURCE == 2
-    return (uint8_t)(vssSpeedKmh100 / 100);
-  #elif SPEED_SOURCE == 1
-    return (uint8_t)((uint32_t)analogRead(SPEED_POT_PIN) * 120 / 1023);
+  #if VSS_DEVICE_INSTALLED
+    // 0 when the VSS device is absent — SET then captures "no target" (safe).
+    return (uint8_t)(canSpeedKmh100 / 100);
   #else
     return (uint8_t)(serialSpeedKmh100 / 100);
   #endif
@@ -729,71 +676,30 @@ void process_cruise_event(uint8_t event, bool main_on) {
 }
 
 // ============================================================================
-// BUTTON HANDLING
+// CRUISE STALK INPUT
 // ============================================================================
 
-void check_buttons() {
-  unsigned long now = millis();
-
-  // --- CAN stalk input ---
-  // When AUTO_DETECT_STALK_DEVICE=false: always process CAN stalk (no fallback)
-  // When AUTO_DETECT_STALK_DEVICE=true: only process when stalk device is present
-  #if AUTO_DETECT_STALK_DEVICE
-  if (stalkDevicePresent) {
-  #endif
-    // Process button events (SET, RES, CANCEL, MAIN_TOGGLE)
-    if (stalkButtonEvent != STALK_BTN_NONE) {
-      process_cruise_event(stalkButtonEvent, stalkMainOn);
-      stalkButtonEvent = STALK_BTN_NONE;  // Consume the event
-    }
-
-    // Detect MAIN state changes from non-event frames.
-    // Fixes desync when a MAIN_TOGGLE event frame is lost: the MAIN state
-    // (byte 1) still arrives correctly on subsequent NONE frames. By
-    // detecting the edge here, we recover even without the event code.
-    if (stalkMainChanged) {
-      stalkMainChanged = false;
-      // Only act if the stalk's MAIN state disagrees with emulator state
-      bool emulatorMainOn = (cruiseState != CRUISE_OFF);
-      if (stalkMainOn != emulatorMainOn) {
-        process_cruise_event(STALK_BTN_MAIN_TOGGLE, stalkMainOn);
-      }
-    }
-  #if AUTO_DETECT_STALK_DEVICE
+// Apply the latest CAN stalk (0x69) input to the cruise state machine.
+// The emulator always expects the CAN stalk — there is no digital-button fallback.
+void handle_stalk_input() {
+  // Process button events (SET, RES, CANCEL, MAIN_TOGGLE)
+  if (stalkButtonEvent != STALK_BTN_NONE) {
+    process_cruise_event(stalkButtonEvent, stalkMainOn);
+    stalkButtonEvent = STALK_BTN_NONE;  // Consume the event
   }
-  #endif
 
-  // --- Digital button fallback (auto-detect only, when stalk device absent) ---
-  #if AUTO_DETECT_STALK_DEVICE
-  if (!stalkDevicePresent) {
-    // SET button
-    if (digitalRead(SET_BUTTON_PIN) == HIGH && (now - lastDebounce_set) > DEBOUNCE_MS) {
-      lastDebounce_set = now;
-      process_cruise_event(STALK_BTN_SET, cruiseMain);
-    }
-
-    // RES button
-    if (digitalRead(RES_BUTTON_PIN) == HIGH && (now - lastDebounce_res) > DEBOUNCE_MS) {
-      lastDebounce_res = now;
-      process_cruise_event(STALK_BTN_RES, cruiseMain);
-    }
-
-    // CANCEL button
-    if (digitalRead(CANCEL_BUTTON_PIN) == HIGH && (now - lastDebounce_cancel) > DEBOUNCE_MS) {
-      lastDebounce_cancel = now;
-      process_cruise_event(STALK_BTN_CANCEL, cruiseMain);
-    }
-
-    // MAIN toggle
-    if (digitalRead(MAIN_BUTTON_PIN) == HIGH && (now - lastDebounce_main) > DEBOUNCE_MS) {
-      lastDebounce_main = now;
-      bool newMain = (cruiseState == CRUISE_OFF);
-      process_cruise_event(STALK_BTN_MAIN_TOGGLE, newMain);
+  // Detect MAIN state changes from non-event frames.
+  // Fixes desync when a MAIN_TOGGLE event frame is lost: the MAIN state
+  // (byte 1) still arrives correctly on subsequent NONE frames. By
+  // detecting the edge here, we recover even without the event code.
+  if (stalkMainChanged) {
+    stalkMainChanged = false;
+    // Only act if the stalk's MAIN state disagrees with emulator state
+    bool emulatorMainOn = (cruiseState != CRUISE_OFF);
+    if (stalkMainOn != emulatorMainOn) {
+      process_cruise_event(STALK_BTN_MAIN_TOGGLE, stalkMainOn);
     }
   }
-  #endif
-
-  // Gear: always Drive when testing without VSS device (no local switch)
 }
 
 // ============================================================================
@@ -805,29 +711,14 @@ void setup() {
   delay(1000);
   Serial.println("Corolla CAN Emulator starting...");
 
-  // Button pins
-  pinMode(SET_BUTTON_PIN, INPUT);
-  pinMode(RES_BUTTON_PIN, INPUT);
-  pinMode(CANCEL_BUTTON_PIN, INPUT);
-  pinMode(MAIN_BUTTON_PIN, INPUT);
-  // Gear defaults to Drive (gearInDrive=true). No local switch — VSS device handles gear when present.
+  // Brake pedal switch — the emulator's only physical input.
+  // Gear defaults to Drive (gearInDrive=true); the VSS device owns gear (0x3BC).
   pinMode(BRAKE_PIN, INPUT_PULLUP);  // NC switch: LOW=not pressed, HIGH=pressed (or wire break — fail-safe)
 
-  // Spare inputs — reserved, not yet read
-  pinMode(SPARE_INPUT_1, INPUT_PULLUP);
-  pinMode(SPARE_INPUT_2, INPUT_PULLUP);
-  pinMode(SPARE_INPUT_3, INPUT_PULLUP);
-
-  // VSS interrupt setup
-  #if SPEED_SOURCE == 2
-  pinMode(VSS_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(VSS_PIN), vssISR, FALLING);
-  Serial.print(F("Speed source: VSS on pin "));
-  Serial.println(VSS_PIN);
-  #elif SPEED_SOURCE == 1
-  Serial.println(F("Speed source: potentiometer"));
+  #if VSS_DEVICE_INSTALLED
+  Serial.println(F("Speed source: external VSS device (CAN 0xAA)"));
   #else
-  Serial.println(F("Speed source: serial (type mph + enter)"));
+  Serial.println(F("Speed source: serial (type mph + enter) — emulator sends 0xAA/0xB4"));
   #endif
 
   // Init MCP2515
@@ -842,8 +733,7 @@ void setup() {
   Serial.print("REAL_EPS_CONNECTED:   "); Serial.println(REAL_EPS_CONNECTED ? "true" : "false");
   Serial.print("REAL_SAS_CONNECTED:   "); Serial.println(REAL_SAS_CONNECTED ? "true" : "false");
   Serial.print("REAL_PEDAL_CONNECTED: "); Serial.println(REAL_PEDAL_CONNECTED ? "true" : "false");
-  Serial.print("AUTO_DETECT_SPEED:    "); Serial.println(AUTO_DETECT_SPEED_DEVICE ? "true (listen for 0xAA)" : "false");
-  Serial.print("AUTO_DETECT_STALK:    "); Serial.println(AUTO_DETECT_STALK_DEVICE ? "true (listen for 0x69)" : "false");
+  Serial.print("VSS_DEVICE_INSTALLED: "); Serial.println(VSS_DEVICE_INSTALLED ? "true (listen for 0xAA)" : "false (serial speed; send 0xAA/0xB4)");
   Serial.print("SEND_ACC_CONTROL:     "); Serial.println(SEND_ACC_CONTROL ? "true (WARNING!)" : "false");
   Serial.println("--------------");
 }
@@ -855,32 +745,9 @@ void setup() {
 void loop() {
   unsigned long now = micros();
 
-  // Speed in km/h * 100.
-  #if SPEED_SOURCE == 2
-    // VSS: update speed from pulse count every VSS_SAMPLE_MS
-    // now is in micros; vssLastSampleMs is in millis
-    unsigned long nowMs = now / 1000;
-    if (nowMs - vssLastSampleMs >= (unsigned long)VSS_SAMPLE_MS) {
-      noInterrupts();
-      unsigned long count = vssPulseCount;
-      interrupts();
-      unsigned long pulses = count - vssLastCount;
-      vssLastCount = count;
-      unsigned long elapsedMs = nowMs - vssLastSampleMs;
-      vssLastSampleMs = nowMs;
-      // speed_kmh * 100 = (pulses / elapsedMs * 1000) / VSS_PULSES_PER_KM * 3600 * 100
-      //                  = pulses * 360000000 / (elapsedMs * VSS_PULSES_PER_KM)
-      // Use 64-bit to avoid overflow (pulses * 360000000 can exceed uint32 at ~12 pulses)
-      if (elapsedMs > 0 && pulses > 0) {
-        vssSpeedKmh100 = (uint16_t)((uint64_t)pulses * 360000000ULL / ((uint64_t)elapsedMs * VSS_PULSES_PER_KM));
-      } else if (pulses == 0) {
-        vssSpeedKmh100 = 0;
-      }
-    }
-    uint16_t spd = vssSpeedKmh100;
-  #elif SPEED_SOURCE == 1
-    uint16_t spd = (uint32_t)analogRead(SPEED_POT_PIN) * 12000 / 1023;
-  #else
+  // Local speed source — only present in bench mode (no external VSS device).
+  // In production the VSS device owns 0xAA/0xB4, so the emulator sends neither.
+  #if !VSS_DEVICE_INSTALLED
     uint16_t spd = serialSpeedKmh100;
   #endif
 
@@ -897,12 +764,9 @@ void loop() {
   if (now - lastMicros_83hz >= INTERVAL_83HZ) {
     lastMicros_83hz = now;
 
-    #if SEND_WHEEL_SPEEDS
-      #if AUTO_DETECT_SPEED_DEVICE
-        if (!speedDevicePresent) send_wheel_speeds(spd);
-      #else
-        send_wheel_speeds(spd);
-      #endif
+    // 0xAA only when no external VSS device (bench). In production the VSS device owns it.
+    #if SEND_WHEEL_SPEEDS && !VSS_DEVICE_INSTALLED
+      send_wheel_speeds(spd);
     #endif
 
     #if !REAL_SAS_CONNECTED
@@ -923,12 +787,9 @@ void loop() {
       send_gas_sensor();
     #endif
 
-    #if SEND_SPEED
-      #if AUTO_DETECT_SPEED_DEVICE
-        if (!speedDevicePresent) send_speed(spd);
-      #else
-        send_speed(spd);
-      #endif
+    // 0xB4 only when no external VSS device (bench).
+    #if SEND_SPEED && !VSS_DEVICE_INSTALLED
+      send_speed(spd);
     #endif
 
     #if SEND_ENGINE_RPM
@@ -1001,21 +862,20 @@ void loop() {
   if (now - lastMicros_1hz >= INTERVAL_1HZ) {
     lastMicros_1hz = now;
 
-    #if SEND_GEAR_PACKET
-      #if AUTO_DETECT_SPEED_DEVICE
-        if (!speedDevicePresent) send_gear_packet(gearInDrive);
-      #else
-        send_gear_packet(gearInDrive);
-      #endif
+    // 0x3BC only when no external VSS device (bench). The VSS device owns gear.
+    #if SEND_GEAR_PACKET && !VSS_DEVICE_INSTALLED
+      send_gear_packet(gearInDrive);
     #endif
   }
 
-  // --- CAN receive: auto-detect external devices (VSS speed, cruise stalk) ---
+  // --- CAN receive: external VSS speed (0xAA) + cruise stalk (0x69) ---
   check_can_receive();
 
-  // --- Serial speed input + button handling ---
-  check_serial();
-  check_buttons();
+  // --- Serial speed input (bench only) + cruise stalk handling ---
+  #if !VSS_DEVICE_INSTALLED
+    check_serial();
+  #endif
+  handle_stalk_input();
 
   // --- Heartbeat: print status every 2 seconds ---
   print_heartbeat();
