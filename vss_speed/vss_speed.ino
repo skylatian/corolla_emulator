@@ -29,7 +29,7 @@
 // ============================================================================
 
 #define VSS_PIN            3     // VSS signal input (must support hardware interrupt)
-#define VSS_PULSES_PER_KM  3098  // Calibration: pulses per kilometer (measure empirically)
+// Speed curve fit: speed_kph = 1.37*pps + 0.00132*pps^2  (pps = pulses/sec, measured empirically)
 #define VSS_SAMPLE_MS      500   // Sampling window in ms
 #define CAN_CS_PIN         17    // CANBed V1 onboard MCP2515 CS pin
 
@@ -54,7 +54,7 @@ unsigned long lastMicros_83hz = 0;
 unsigned long lastMicros_50hz = 0;
 unsigned long lastMicros_10hz = 0;
 unsigned long lastMillis_hb   = 0;
-#define HEARTBEAT_MS 2000
+#define HEARTBEAT_MS 100
 
 // ============================================================================
 // STATE
@@ -164,12 +164,11 @@ void setup() {
   pinMode(GEAR_REV_PIN, INPUT_PULLUP);
 
   // VSS input
-  pinMode(VSS_PIN, INPUT_PULLUP);
+  pinMode(VSS_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(VSS_PIN), vssISR, FALLING);
   Serial.print(F("VSS pin: "));
   Serial.println(VSS_PIN);
-  Serial.print(F("Pulses/km: "));
-  Serial.println(VSS_PULSES_PER_KM);
+  Serial.println(F("Speed fit: 1.37*pps + 0.00132*pps^2"));
 
   // Init onboard MCP2515
   while (CAN.begin(MCP_ANY, CAN_500KBPS, MCP_16MHZ) != CAN_OK) {
@@ -199,10 +198,11 @@ void loop() {
     unsigned long elapsedMs = nowMs - vssLastSampleMs;
     vssLastSampleMs = nowMs;
 
-    // speed_kmh * 100 = pulses * 360000000 / (elapsedMs * VSS_PULSES_PER_KM)
-    // Use 64-bit to avoid overflow
+    // Curve fit: speed_kph = 1.37*pps + 0.00132*pps^2
     if (elapsedMs > 0 && pulses > 0) {
-      speedKmh100 = (uint16_t)((uint64_t)pulses * 360000000ULL / ((uint64_t)elapsedMs * VSS_PULSES_PER_KM));
+      float pps = (float)pulses * 1000.0f / (float)elapsedMs;
+      float speed_kph = 1.37f * pps + 0.00132f * pps * pps;
+      speedKmh100 = (uint16_t)(speed_kph * 100.0f + 0.5f);
     } else if (pulses == 0) {
       speedKmh100 = 0;
     }
