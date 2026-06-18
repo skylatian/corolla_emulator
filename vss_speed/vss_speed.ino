@@ -29,9 +29,10 @@
 // ============================================================================
 
 #define VSS_PIN            3     // VSS signal input (must support hardware interrupt)
-// Speed curve fit: speed_kph = 1.37*pps + 0.00132*pps^2  (pps = pulses/sec, measured empirically)
-#define VSS_SAMPLE_MS      500   // Sampling window in ms
-#define CAN_CS_PIN         17    // CANBed V1 onboard MCP2515 CS pin
+// Speed fit: speed_kph = 1.45*pps - 1.81 (pps >= 1), else speed_kph = pps
+#define VSS_STALE_US       2000000UL  // No pulse for this long → speed = 0
+#define VSS_RING_SIZE      4          // Period averaging ring buffer length
+#define CAN_CS_PIN         17         // CANBed V1 onboard MCP2515 CS pin
 
 // Set true to always report Drive regardless of switch state (testing override)
 #define FORCE_DRIVE        true
@@ -62,9 +63,10 @@ unsigned long lastMillis_hb   = 0;
 
 MCP_CAN CAN(CAN_CS_PIN);
 
-volatile unsigned long vssPulseCount = 0;
-unsigned long vssLastSampleMs = 0;
-unsigned long vssLastCount = 0;
+volatile unsigned long vssPeriodRing[VSS_RING_SIZE];
+volatile uint8_t vssRingIdx = 0;
+volatile unsigned long vssLastPulseMicros = 0;
+volatile bool vssHasPulse = false;
 uint16_t speedKmh100 = 0;  // speed in km/h * 100
 uint8_t gearState = 0;     // DBC GEAR value: 0=D, 16=R, 32=P
 
@@ -77,7 +79,13 @@ uint32_t txError = 0;
 // ============================================================================
 
 void vssISR() {
-  vssPulseCount++;
+  unsigned long now = micros();
+  if (vssHasPulse) {
+    vssPeriodRing[vssRingIdx] = now - vssLastPulseMicros;
+    vssRingIdx = (vssRingIdx + 1) % VSS_RING_SIZE;
+  }
+  vssLastPulseMicros = now;
+  vssHasPulse = true;
 }
 
 // ============================================================================
@@ -168,7 +176,8 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(VSS_PIN), vssISR, FALLING);
   Serial.print(F("VSS pin: "));
   Serial.println(VSS_PIN);
-  Serial.println(F("Speed fit: 1.37*pps + 0.00132*pps^2"));
+  Serial.println(F("Speed: period measurement, ring="));
+  Serial.println(VSS_RING_SIZE);
 
   // Init onboard MCP2515
   while (CAN.begin(MCP_ANY, CAN_500KBPS, MCP_16MHZ) != CAN_OK) {
@@ -187,24 +196,27 @@ void loop() {
   unsigned long now = micros();
   unsigned long nowMs = now / 1000;
 
-  // --- VSS speed calculation (every VSS_SAMPLE_MS) ---
-  if (nowMs - vssLastSampleMs >= (unsigned long)VSS_SAMPLE_MS) {
-    noInterrupts();
-    unsigned long count = vssPulseCount;
-    interrupts();
+  // --- VSS speed calculation (period measurement) ---
+  noInterrupts();
+  bool hasPulse = vssHasPulse;
+  unsigned long lastPulse = vssLastPulseMicros;
+  unsigned long ring[VSS_RING_SIZE];
+  for (uint8_t i = 0; i < VSS_RING_SIZE; i++) ring[i] = vssPeriodRing[i];
+  interrupts();
 
-    unsigned long pulses = count - vssLastCount;
-    vssLastCount = count;
-    unsigned long elapsedMs = nowMs - vssLastSampleMs;
-    vssLastSampleMs = nowMs;
-
-    // Curve fit: speed_kph = 1.37*pps + 0.00132*pps^2
-    if (elapsedMs > 0 && pulses > 0) {
-      float pps = (float)pulses * 1000.0f / (float)elapsedMs;
-      float speed_kph = 1.37f * pps + 0.00132f * pps * pps;
-      speedKmh100 = (uint16_t)(speed_kph * 100.0f + 0.5f);
-    } else if (pulses == 0) {
-      speedKmh100 = 0;
+  if (!hasPulse || (now - lastPulse) > VSS_STALE_US) {
+    speedKmh100 = 0;
+  } else {
+    unsigned long sum = 0;
+    uint8_t count = 0;
+    for (uint8_t i = 0; i < VSS_RING_SIZE; i++) {
+      if (ring[i] > 0) { sum += ring[i]; count++; }
+    }
+    if (count > 0) {
+      float avgPeriod = (float)sum / (float)count;
+      float pps = 1000000.0f / avgPeriod;
+      float speed_kph = (pps >= 1.0f) ? (1.45f * pps - 1.81f) : pps;
+      speedKmh100 = (speed_kph > 0.0f) ? (uint16_t)(speed_kph * 100.0f + 0.5f) : 0;
     }
   }
 
