@@ -1,9 +1,9 @@
-// VSS Pulse Counter — calibration sketch
+x1// VSS Pulse Counter — calibration sketch
 // Wire VSS signal (V-W wire, 0-5V square wave) to pin 7
 // Open serial monitor at 115200, drive at known GPS speed, note pulses/sec
 // Press ENTER to snapshot the last 3 seconds of readings
 
-#define VSS_PIN 4
+#define VSS_PIN 3
 
 volatile unsigned long pulseCount = 0;
 
@@ -28,7 +28,7 @@ void setup() {
   Serial.println();
 
   memset(history, 0, sizeof(history));
-  pinMode(VSS_PIN, INPUT_PULLUP);
+  pinMode(VSS_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(VSS_PIN), vssISR, FALLING);
 }
 
@@ -48,7 +48,7 @@ void loop() {
     history[histIdx] = delta;
     histIdx = (histIdx + 1) % HISTORY;
 
-    Serial.print("pulses/sec: ");
+    // Serial.print("pulses/sec: ");
     Serial.println(delta);
   }
 
