@@ -45,7 +45,7 @@ MCP_CAN CAN(9);  // Seeed CAN Bus Shield v2: CS on D9 (not D10)
 // When false (bench, no VSS device): the emulator reads speed from the serial
 // monitor (type mph + enter) and sends 0xAA/0xB4/0x3BC itself.
 #define VSS_DEVICE_INSTALLED      true
-#define SPEED_DEVICE_TIMEOUT_MS   1000  // 1 second without 0xAA = device gone (heartbeat display)
+#define SPEED_DEVICE_TIMEOUT_MS   100  // 1 second without 0xAA = device gone (heartbeat display)
 
 // External cruise stalk device (0x69). The emulator always expects the CAN stalk —
 // there is no digital-button fallback. If the stalk device goes silent for
@@ -93,7 +93,7 @@ unsigned long lastMicros_10hz = 0;
 unsigned long lastMicros_3hz  = 0;
 unsigned long lastMicros_1hz  = 0;
 unsigned long lastMillis_hb   = 0;  // heartbeat
-#define HEARTBEAT_MS 2000
+#define HEARTBEAT_MS 500
 
 // ============================================================================
 // STATE
