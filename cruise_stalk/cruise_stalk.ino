@@ -59,7 +59,7 @@
 #define STALK_CAN_ID  0x69
 
 // Set true to force relay ON (stalk to Arduino) regardless of C3 detection (testing override)
-#define FORCE_RELAY_ON  true
+#define FORCE_RELAY_ON  false
 
 // CAN message ID to detect openpilot onroad (only OP sends this via panda)
 #define C3_DETECT_ID  0x2E4
