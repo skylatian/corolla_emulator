@@ -81,16 +81,21 @@
 
 // note: these values are all with a ~470 ohm resistor (measured about 466)
 
-#define STALK_SET_MIN      380 // mid ~430
-#define STALK_SET_MAX      490
+#define STALK_RANGE        75   // Half-width around each midpoint
 
-#define STALK_RES_MIN      625 // mid ~675
-#define STALK_RES_MAX      725
+#define STALK_SET_MID      430
+#define STALK_SET_MIN      (STALK_SET_MID - STALK_RANGE)
+#define STALK_SET_MAX      (STALK_SET_MID + STALK_RANGE)
 
-#define STALK_CANCEL_MIN   185 // mid ~235
-#define STALK_CANCEL_MAX   295
+#define STALK_RES_MID      675
+#define STALK_RES_MIN      (STALK_RES_MID - STALK_RANGE)
+#define STALK_RES_MAX      (STALK_RES_MID + STALK_RANGE)
 
-#define STALK_MAIN_MIN     900 // max
+#define STALK_CANCEL_MID   235
+#define STALK_CANCEL_MIN   (STALK_CANCEL_MID - STALK_RANGE)
+#define STALK_CANCEL_MAX   (STALK_CANCEL_MID + STALK_RANGE)
+
+#define STALK_MAIN_MIN     900
 #define STALK_MAIN_MAX     1023
 
 // ============================================================================
