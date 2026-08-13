@@ -98,6 +98,10 @@
 #define STALK_MAIN_MIN     900
 #define STALK_MAIN_MAX     1023
 
+static_assert(STALK_CANCEL_MAX < STALK_SET_MIN,  "CANCEL and SET ranges overlap");
+static_assert(STALK_SET_MAX    < STALK_RES_MIN,  "SET and RES ranges overlap");
+static_assert(STALK_RES_MAX    < STALK_MAIN_MIN, "RES and MAIN ranges overlap");
+
 // ============================================================================
 // BUTTON EVENT CODES (byte 0 of CAN message)
 // ============================================================================
