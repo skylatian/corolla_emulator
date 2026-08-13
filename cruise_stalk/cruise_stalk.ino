@@ -85,7 +85,7 @@
 #define STALK_SET_MAX      490
 
 #define STALK_RES_MIN      625 // mid ~675
-#define STALK_RES_MAX      925
+#define STALK_RES_MAX      725
 
 #define STALK_CANCEL_MIN   185 // mid ~235
 #define STALK_CANCEL_MAX   295
@@ -113,6 +113,7 @@
 // SET/RES auto-repeat: after holding for REPEAT_DELAY_MS, repeat every REPEAT_INTERVAL_MS
 #define REPEAT_DELAY_MS     500   // Initial hold before repeating starts
 #define REPEAT_INTERVAL_MS  200   // Repeat rate once held (5 km/h per second)
+#define DEBOUNCE_MS          20   // ADC must read stable for this long before accepting
 
 unsigned long lastMicros_20hz = 0;
 unsigned long lastMillis_hb   = 0;
@@ -128,6 +129,13 @@ uint8_t pendingEvent = BTN_NONE;  // Button event to send (cleared after one fra
 uint8_t lastButton = BTN_NONE;   // Previous loop's decoded button (for edge detection)
 unsigned long holdStartMs = 0;   // When the current button was first pressed
 unsigned long lastRepeatMs = 0;  // Last auto-repeat timestamp
+
+// Debounce state
+uint8_t candidateBtn = BTN_NONE;     // Button being debounced
+unsigned long candidateStartMs = 0;  // When candidate first appeared
+uint8_t stableBtn = BTN_NONE;       // Last confirmed-stable button
+uint32_t debounceRejects = 0;       // Noise metric: candidates that didn't settle
+uint32_t debounceRejectsLastHb = 0;
 
 // C3/relay state
 bool c3Present = false;           // true when 0x2E4 seen within timeout
@@ -162,8 +170,19 @@ uint8_t decode_stalk_adc() {
 // SET and RES: fire on initial press, then auto-repeat after hold delay.
 // Returns BTN_NONE if no event to send.
 uint8_t read_stalk() {
-  uint8_t btn = decode_stalk_adc();
+  uint8_t rawBtn = decode_stalk_adc();
   unsigned long now = millis();
+
+  // Debounce: require stable reading for DEBOUNCE_MS before accepting
+  if (rawBtn != candidateBtn) {
+    if (candidateBtn != stableBtn) debounceRejects++;
+    candidateBtn = rawBtn;
+    candidateStartMs = now;
+  }
+  if (candidateBtn != stableBtn && (now - candidateStartMs) >= DEBOUNCE_MS) {
+    stableBtn = candidateBtn;
+  }
+  uint8_t btn = stableBtn;
 
   // --- New press (rising edge: NONE or different button → this button) ---
   if (btn != BTN_NONE && btn != lastButton) {
@@ -322,6 +341,10 @@ void check_can_receive() {
     if (!c3Present) {
       c3Present = true;
       digitalWrite(RELAY_PIN, HIGH);  // Route stalk to Arduino
+      lastButton = BTN_NONE;
+      candidateBtn = BTN_NONE;
+      stableBtn = BTN_NONE;
+      candidateStartMs = nowMs;
       Serial.println(F("C3 DETECTED (0x2E4) — relay ON, stalk to Arduino"));
     }
   }
@@ -330,6 +353,9 @@ void check_can_receive() {
   if (c3Present && (nowMs - lastC3Ms) >= C3_TIMEOUT_MS) {
     c3Present = false;
     digitalWrite(RELAY_PIN, LOW);  // Route stalk back to stock ECU
+    lastButton = BTN_NONE;
+    candidateBtn = BTN_NONE;
+    stableBtn = BTN_NONE;
     Serial.println(F("C3 LOST — relay OFF, stalk to stock ECU"));
 
     #if C3_TIMEOUT_SEND_CANCEL
@@ -442,6 +468,9 @@ void loop() {
     if (c3Present) {
       Serial.print(F("  ADC: "));
       Serial.print(analogRead(STALK_PIN));
+      Serial.print(F("  noise: "));
+      Serial.print(debounceRejects - debounceRejectsLastHb);
+      debounceRejectsLastHb = debounceRejects;
     }
     Serial.print(F("  Blink: "));
     switch (turnSignals) {
