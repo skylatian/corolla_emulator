@@ -31,7 +31,9 @@
 #define VSS_PIN            3     // VSS signal input (must support hardware interrupt)
 // Speed fit: speed_kph = 1.45*pps - 1.81 (pps >= 1), else speed_kph = pps
 #define VSS_STALE_US       2000000UL  // No pulse for this long → speed = 0
-#define VSS_RING_SIZE      4          // Period averaging ring buffer length
+#define VSS_RING_SIZE      8          // Period averaging ring buffer length
+#define EMA_K              3          // Output smoothing: smooth += (raw - smooth) / K per pulse
+                                      // K=2: fast (50%), K=3: moderate (33%), K=4: smooth (25%)
 #define CAN_CS_PIN         17         // CANBed V1 onboard MCP2515 CS pin
 
 // Set true to always report Drive regardless of switch state (testing override)
@@ -67,7 +69,10 @@ volatile unsigned long vssPeriodRing[VSS_RING_SIZE];
 volatile uint8_t vssRingIdx = 0;
 volatile unsigned long vssLastPulseMicros = 0;
 volatile bool vssHasPulse = false;
-uint16_t speedKmh100 = 0;  // speed in km/h * 100
+uint16_t speedKmh100 = 0;     // smoothed speed in km/h * 100 (sent on CAN)
+uint16_t rawSpeedKmh100 = 0;  // unfiltered speed computation
+uint32_t smoothedX256 = 0;    // EMA fixed-point state (speed*100 << 8)
+uint8_t lastRingIdx = 0;      // pulse arrival tracking for EMA
 uint8_t gearState = 0;     // DBC GEAR value: 0=D, 16=R, 32=P
 
 // TX stats
@@ -200,12 +205,14 @@ void loop() {
   noInterrupts();
   bool hasPulse = vssHasPulse;
   unsigned long lastPulse = vssLastPulseMicros;
+  uint8_t currentIdx = vssRingIdx;
   unsigned long ring[VSS_RING_SIZE];
   for (uint8_t i = 0; i < VSS_RING_SIZE; i++) ring[i] = vssPeriodRing[i];
   interrupts();
 
   if (!hasPulse || (now - lastPulse) > VSS_STALE_US) {
-    speedKmh100 = 0;
+    rawSpeedKmh100 = 0;
+    smoothedX256 = 0;
   } else {
     unsigned long sum = 0;
     uint8_t count = 0;
@@ -216,9 +223,15 @@ void loop() {
       float avgPeriod = (float)sum / (float)count;
       float pps = 1000000.0f / avgPeriod;
       float speed_kph = (pps >= 1.0f) ? (1.45f * pps - 1.81f) : pps;
-      speedKmh100 = (speed_kph > 0.0f) ? (uint16_t)(speed_kph * 100.0f + 0.5f) : 0;
+      rawSpeedKmh100 = (speed_kph > 0.0f) ? (uint16_t)(speed_kph * 100.0f + 0.5f) : 0;
+    }
+    if (currentIdx != lastRingIdx) {
+      lastRingIdx = currentIdx;
+      int32_t error = (int32_t)rawSpeedKmh100 * 256 - (int32_t)smoothedX256;
+      smoothedX256 += error / EMA_K;
     }
   }
+  speedKmh100 = (uint16_t)(smoothedX256 / 256);
 
   // --- Gear selection (every loop — digitalRead is ~4µs) ---
   gearState = read_gear();
@@ -247,7 +260,7 @@ void loop() {
     Serial.print(F("Speed: "));
     Serial.print(speedKmh100 / 100);
     Serial.print(F(" km/h (raw "));
-    Serial.print(speedKmh100);
+    Serial.print(rawSpeedKmh100 / 100);
     Serial.print(F(")  Gear: "));
     switch (gearState) {
       case 0:  Serial.print(F("D")); break;
