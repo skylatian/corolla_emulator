@@ -1,0 +1,47 @@
+#!/bin/sh
+# Every commit that changes one of the car ECU sketches must bump that sketch's
+# FW_VERSION, in the format MMDDYY + one character a-z or 0-9 (e.g. 092726a).
+# The version is reported on CAN (0x503-0x505) and logged by openpilot, so a
+# drive log can be tied back to the exact firmware that was running.
+#
+# Enable once per clone:   git config core.hooksPath .githooks
+# Skip for one commit:     git commit --no-verify
+
+SKETCHES="cruise_stalk/cruise_stalk.ino fakeecu/corolla_emulator/corolla_emulator.ino vss_speed/vss_speed.ino"
+FORMAT='^(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[0-9][0-9][a-z0-9]$'
+
+version_of() {
+  sed -n 's/^#define FW_VERSION *"\([^"]*\)".*/\1/p' | head -n 1
+}
+
+fail=0
+for sketch in $SKETCHES; do
+  dir=$(dirname "$sketch")
+  # Skip sketches this commit doesn't touch
+  if git diff --cached --quiet -- "$dir"; then
+    continue
+  fi
+  # Deleted sketch: nothing to check
+  if ! git cat-file -e ":$sketch" 2>/dev/null; then
+    continue
+  fi
+
+  new=$(git show ":$sketch" | version_of)
+  old=$(git show "HEAD:$sketch" 2>/dev/null | version_of)
+
+  if [ -z "$new" ]; then
+    echo "pre-commit: $sketch has no '#define FW_VERSION \"...\"' line" >&2
+    fail=1
+  elif ! echo "$new" | grep -Eq "$FORMAT"; then
+    echo "pre-commit: $sketch FW_VERSION \"$new\" is not MMDDYY + one of a-z/0-9 (e.g. 092726a)" >&2
+    fail=1
+  elif [ "$new" = "$old" ]; then
+    echo "pre-commit: $sketch changed but FW_VERSION is still \"$old\" - bump it" >&2
+    fail=1
+  fi
+done
+
+if [ "$fail" -ne 0 ]; then
+  echo "pre-commit: commit blocked (bypass with --no-verify if the change really isn't firmware)" >&2
+fi
+exit $fail

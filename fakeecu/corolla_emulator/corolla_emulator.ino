@@ -19,6 +19,24 @@
 #include <avr/pgmspace.h>
 #include <mcp_can.h>  // coryjfowler mcp_can 1.5.1
 
+// ============================================================================
+// FIRMWARE VERSION
+// Bump FW_VERSION in every commit that changes this sketch: MMDDYY plus one
+// character, a-z then 0-9 (e.g. "092726a", "092726b"). The pre-commit hook in
+// .githooks/ enforces the bump and the format. Never used for fingerprinting.
+//
+// VERSION_CAN_ID (8 bytes, alternating pages, each page every ~1 s):
+//   byte 0      PAGE   0 = version tag, 1 = build time
+//   page 0      bytes 1-7: FW_VERSION as ASCII
+//   page 1      bytes 1-6: build year-2000, month, day, hour, minute, second
+//               (compiler __DATE__/__TIME__, so a flash of an edited but
+//               un-bumped sketch still shows up as a different build)
+// ============================================================================
+
+#define FW_VERSION      "092726a"
+#define VERSION_CAN_ID  0x503
+static_assert(sizeof(FW_VERSION) - 1 == 7, "FW_VERSION must be 7 characters: MMDDYY + one of a-z/0-9");
+
 #define CAN_CS_PIN 9
 MCP_CAN CAN(CAN_CS_PIN);  // Seeed CAN Bus Shield v2: CS on D9 (not D10)
 
@@ -966,6 +984,50 @@ void send_diag() {
 }
 
 // ============================================================================
+// FIRMWARE VERSION FRAME
+// ============================================================================
+
+uint8_t buildTime[6];  // year-2000, month, day, hour, minute, second
+uint8_t versionPage = 0;
+
+uint8_t two_digits(const char *s) {
+  return (uint8_t)((s[0] == ' ' ? 0 : s[0] - '0') * 10 + (s[1] - '0'));
+}
+
+// __DATE__ is "Sep 27 2026" (day space-padded), __TIME__ is "14:03:22".
+void parse_build_time() {
+  static const char months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+  const char *date = __DATE__;
+  const char *time = __TIME__;
+  buildTime[1] = 0;
+  for (uint8_t i = 0; i < 12; i++) {
+    if (strncmp(date, months + 3 * i, 3) == 0) buildTime[1] = i + 1;
+  }
+  buildTime[0] = two_digits(date + 9);
+  buildTime[2] = two_digits(date + 4);
+  buildTime[3] = two_digits(time);
+  buildTime[4] = two_digits(time + 3);
+  buildTime[5] = two_digits(time + 6);
+}
+
+void print_version() {
+  Serial.print(F("Firmware " FW_VERSION ", built " __DATE__ " " __TIME__));
+  Serial.println();
+}
+
+// Called with every diagnostics frame: alternates the version tag and build time.
+void send_version_page() {
+  uint8_t data[8] = {versionPage, 0, 0, 0, 0, 0, 0, 0};
+  if (versionPage == 0) {
+    memcpy(data + 1, FW_VERSION, 7);
+  } else {
+    memcpy(data + 1, buildTime, 6);
+  }
+  sendMsg(VERSION_CAN_ID, data, 8);
+  versionPage ^= 1;
+}
+
+// ============================================================================
 // SETUP
 // ============================================================================
 
@@ -974,6 +1036,8 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("Corolla CAN Emulator starting...");
+  parse_build_time();
+  print_version();
   Serial.print(F("Boot #"));
   Serial.println(bootCount);
 
@@ -1153,6 +1217,7 @@ void loop() {
     diagDue = false;
     lastDiagMs = nowMs;
     send_diag();
+    send_version_page();
   }
 
   // --- Heartbeat: print status every 500 ms ---
