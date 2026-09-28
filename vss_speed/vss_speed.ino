@@ -9,20 +9,23 @@
 //           Park/Neutral switch → GEAR_PN_PIN (INPUT_PULLUP, LOW = P/N)
 //           Reverse switch → GEAR_REV_PIN (INPUT_PULLUP, LOW = Reverse)
 //
-// Library:  Longan Labs Arduino_CAN_BUS_MCP2515
-//           https://github.com/Longan-Labs/Aruino_CAN_BUS_MCP2515
+// Library:  mcp_can 1.5.1 (coryjfowler) — this is what `#include <mcp_can.h>`
+//           resolves to for the Leonardo build (checked with arduino-cli -v).
 //
 // Sends:
 //   0xAA WHEEL_SPEEDS  at 83 Hz — 4 identical 16-bit BE wheel speeds
 //   0xB4 SPEED         at 50 Hz — 16-bit BE speed with toyota_checksum
 //   0x3BC GEAR_PACKET  at 10 Hz — gear position (D/R/P)
+//   0x502 RETROFIT_VSS_DIAG at 2 Hz — boot count, CAN health, VSS pulse count
+//         (layout in the DIAGNOSTICS section; decoded by openpilot's DBC)
 //
 // This device owns 0xAA, 0xB4, and 0x3BC on the bus. The main emulator
 // should have SEND_GEAR_PACKET=false and AUTO_DETECT_SPEED_DEVICE=true.
 // ============================================================================
 
 #include <SPI.h>
-#include <mcp_can.h>  // Longan Labs MCP2515 library
+#include <EEPROM.h>
+#include <mcp_can.h>  // coryjfowler mcp_can 1.5.1
 
 // ============================================================================
 // CONFIGURATION
@@ -60,6 +63,52 @@ unsigned long lastMillis_hb   = 0;
 #define HEARTBEAT_MS 100
 
 // ============================================================================
+// DIAGNOSTICS + CAN HEALTH
+//
+// 0x502 RETROFIT_VSS_DIAG (8 bytes, 2 Hz + once right after boot):
+//   byte 0      BOOT_COUNT       increments every boot (EEPROM), wraps at 255
+//   byte 1 hi   ROLLING_COUNTER  4-bit (deliberately not named COUNTER — openpilot's
+//                                parser would count a jump after a reboot as a CAN error)
+//   byte 1 lo   RESET_KIND       see RESET_* (the bootloader clears MCUSR, so usually 0)
+//   byte 2 7:6  RECOVERY_REASON  last CAN controller recovery (RECOVER_*)
+//   byte 2 b5   FORCE_DRIVE      compile-time override is on
+//   byte 2 3:0  CAN_RECOVERIES   controller re-inits since boot (saturates at 15)
+//   byte 3      CAN_ERROR_FLAGS  MCP2515 EFLG, OR-latched since the last frame. RX
+//                                overflow bits are masked: this device never reads RX.
+//   byte 4      TX_FAILS         failed sends since the last frame (saturates)
+//   byte 5      VSS_PULSES       VSS pulses since the last frame (saturates)
+//   byte 6      LOOP_MAX_MS      slowest loop() since the last frame (saturates)
+//   byte 7      CHECKSUM         toyota_checksum
+// ============================================================================
+
+#define DIAG_CAN_ID          0x502
+#define DIAG_INTERVAL_MS     500
+#define HEALTH_INTERVAL_MS   100
+#define TX_STUCK_MS          500   // no successful send for this long → re-init controller
+#define RECOVERY_RETRY_MS    500
+
+#define EE_BOOT_COUNT   0
+
+// RESET_KIND values (shared with the emulator and stalk devices)
+#define RESET_UNKNOWN     0
+#define RESET_POWER_ON    1
+#define RESET_BROWN_OUT   2
+#define RESET_EXTERNAL    3
+#define RESET_WATCHDOG    4
+
+// RECOVERY_REASON values
+#define RECOVER_NONE      0
+#define RECOVER_TX_STUCK  1
+#define RECOVER_MODE      2
+#define RECOVER_BUS_OFF   3
+
+#define REG_CANSTAT      0x0E
+#define REG_EFLG         0x2D
+#define CANSTAT_OPMOD    0xE0  // bits 7:5, 000 = normal
+#define EFLG_RX_OVERFLOW 0xC0
+#define EFLG_TXBO        0x20
+
+// ============================================================================
 // STATE
 // ============================================================================
 
@@ -79,6 +128,22 @@ uint8_t gearState = 0;     // DBC GEAR value: 0=D, 16=R, 32=P
 uint32_t txOk    = 0;
 uint32_t txError = 0;
 
+// Diagnostics state
+volatile uint16_t vssPulseCount = 0;  // pulses since the last diag frame (ISR)
+uint8_t bootCount = 0;
+uint8_t resetKind = RESET_UNKNOWN;
+uint8_t diagRolling = 0;
+uint8_t eflgLatched = 0;
+uint8_t txFailsSinceDiag = 0;
+uint8_t canRecoveries = 0;
+uint8_t lastRecoveryReason = RECOVER_NONE;
+unsigned long loopMaxUs = 0;
+unsigned long lastTxOkMs = 0;
+unsigned long lastHealthMs = 0;
+unsigned long lastRecoveryMs = 0;
+unsigned long lastDiagMs = 0;
+bool diagDue = true;
+
 // ============================================================================
 // VSS INTERRUPT
 // ============================================================================
@@ -91,6 +156,7 @@ void vssISR() {
   }
   vssLastPulseMicros = now;
   vssHasPulse = true;
+  vssPulseCount++;
 }
 
 // ============================================================================
@@ -119,8 +185,10 @@ void sendMsg(uint16_t id, uint8_t *data, uint8_t len) {
   byte result = CAN.sendMsgBuf(id, 0, len, data);
   if (result == CAN_OK) {
     txOk++;
+    lastTxOkMs = millis();
   } else {
     txError++;
+    if (txFailsSinceDiag < 255) txFailsSinceDiag++;
   }
 }
 
@@ -165,12 +233,103 @@ uint8_t read_gear() {
 }
 
 // ============================================================================
+// DIAGNOSTICS + CAN CONTROLLER HEALTH
+// ============================================================================
+
+// Why we booted. The Leonardo bootloader clears MCUSR, so this is usually
+// RESET_UNKNOWN; the boot counter is what reliably shows a restart.
+void diag_boot() {
+  uint8_t mcusr = MCUSR;
+  MCUSR = 0;
+  if (mcusr & _BV(WDRF)) resetKind = RESET_WATCHDOG;
+  else if (mcusr & _BV(BORF)) resetKind = RESET_BROWN_OUT;
+  else if (mcusr & _BV(EXTRF)) resetKind = RESET_EXTERNAL;
+  else if (mcusr & _BV(PORF)) resetKind = RESET_POWER_ON;
+  else resetKind = RESET_UNKNOWN;
+  bootCount = EEPROM.read(EE_BOOT_COUNT) + 1;
+  EEPROM.update(EE_BOOT_COUNT, bootCount);
+}
+
+uint8_t mcp_read_register(uint8_t address) {
+  SPI.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0));
+  digitalWrite(CAN_CS_PIN, LOW);
+  SPI.transfer(0x03);  // READ
+  SPI.transfer(address);
+  uint8_t value = SPI.transfer(0x00);
+  digitalWrite(CAN_CS_PIN, HIGH);
+  SPI.endTransaction();
+  return value;
+}
+
+// Bring the MCP2515 up in normal mode. Used at boot and for recovery.
+bool can_init() {
+  if (CAN.begin(MCP_ANY, CAN_500KBPS, MCP_16MHZ) != CAN_OK) {
+    return false;
+  }
+  if (CAN.setMode(MCP_NORMAL) != MCP2515_OK) {
+    return false;
+  }
+  lastTxOkMs = millis();
+  return true;
+}
+
+// Re-initialize a stuck or reset controller. While this device is silent openpilot
+// times out 0xAA/0xB4 and disengages; recovery just gets speed flowing again.
+void can_health_check(unsigned long nowMs) {
+  uint8_t eflg = mcp_read_register(REG_EFLG);
+  eflgLatched |= (eflg & ~EFLG_RX_OVERFLOW);
+
+  uint8_t reason = RECOVER_NONE;
+  if ((mcp_read_register(REG_CANSTAT) & CANSTAT_OPMOD) != 0) {
+    reason = RECOVER_MODE;
+  } else if (nowMs - lastTxOkMs >= TX_STUCK_MS) {
+    reason = (eflg & EFLG_TXBO) ? RECOVER_BUS_OFF : RECOVER_TX_STUCK;
+  }
+  if (reason != RECOVER_NONE && nowMs - lastRecoveryMs >= RECOVERY_RETRY_MS) {
+    lastRecoveryMs = nowMs;
+    lastRecoveryReason = reason;
+    if (canRecoveries < 255) canRecoveries++;
+    Serial.print(F("CAN recovery, reason "));
+    Serial.println(reason);
+    if (can_init()) diagDue = true;
+  }
+}
+
+void send_diag() {
+  noInterrupts();
+  uint16_t pulses = vssPulseCount;
+  vssPulseCount = 0;
+  interrupts();
+
+  unsigned long loopMaxMs = loopMaxUs / 1000;
+  uint8_t data[8];
+  data[0] = bootCount;
+  data[1] = (uint8_t)((diagRolling & 0x0F) << 4) | (resetKind & 0x0F);
+  data[2] = (uint8_t)((lastRecoveryReason & 0x03) << 6) | (FORCE_DRIVE ? 0x20 : 0x00) |
+            min(canRecoveries, (uint8_t)15);
+  data[3] = eflgLatched;
+  data[4] = txFailsSinceDiag;
+  data[5] = pulses > 255 ? 255 : (uint8_t)pulses;
+  data[6] = loopMaxMs > 255 ? 255 : (uint8_t)loopMaxMs;
+  data[7] = toyota_checksum(DIAG_CAN_ID, data, 8);
+  sendMsg(DIAG_CAN_ID, data, 8);
+
+  diagRolling = (diagRolling + 1) & 0x0F;
+  eflgLatched = 0;
+  txFailsSinceDiag = 0;
+  loopMaxUs = 0;
+}
+
+// ============================================================================
 // SETUP
 // ============================================================================
 
 void setup() {
+  diag_boot();
   Serial.begin(115200);
   Serial.println(F("VSS Speed Device starting..."));
+  Serial.print(F("Boot #"));
+  Serial.println(bootCount);
 
   // Gear selection switches
   pinMode(GEAR_PN_PIN, INPUT_PULLUP);
@@ -185,11 +344,10 @@ void setup() {
   Serial.println(VSS_RING_SIZE);
 
   // Init onboard MCP2515
-  while (CAN.begin(MCP_ANY, CAN_500KBPS, MCP_16MHZ) != CAN_OK) {
+  while (!can_init()) {
     Serial.println(F("CAN init failed, retrying..."));
     delay(500);
   }
-  CAN.setMode(MCP_NORMAL);
   Serial.println(F("CAN BUS init ok — sending 0xAA + 0xB4 + 0x3BC"));
 }
 
@@ -254,6 +412,17 @@ void loop() {
     send_gear_packet(gearState);
   }
 
+  // --- CAN controller health + 2 Hz diagnostics frame ---
+  if (nowMs - lastHealthMs >= HEALTH_INTERVAL_MS) {
+    lastHealthMs = nowMs;
+    can_health_check(nowMs);
+  }
+  if (diagDue || nowMs - lastDiagMs >= DIAG_INTERVAL_MS) {
+    diagDue = false;
+    lastDiagMs = nowMs;
+    send_diag();
+  }
+
   // --- Heartbeat ---
   if (nowMs - lastMillis_hb >= HEARTBEAT_MS) {
     lastMillis_hb = nowMs;
@@ -271,6 +440,13 @@ void loop() {
     Serial.print(F("  TX ok: "));
     Serial.print(txOk);
     Serial.print(F("  err: "));
-    Serial.println(txError);
+    Serial.print(txError);
+    Serial.print(F("  boot: "));
+    Serial.print(bootCount);
+    Serial.print(F("  recov: "));
+    Serial.println(canRecoveries);
   }
+
+  unsigned long loopUs = micros() - now;
+  if (loopUs > loopMaxUs) loopMaxUs = loopUs;
 }
