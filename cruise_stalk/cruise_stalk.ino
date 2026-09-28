@@ -10,12 +10,24 @@
 //           Left blinker sense → BLINKER_LEFT_PIN (12V via divider, LOW = active)
 //           Right blinker sense → BLINKER_RIGHT_PIN (12V via divider, LOW = active)
 //
-// Library:  Longan Labs Arduino_CAN_BUS_MCP2515
-//           https://github.com/Longan-Labs/Aruino_CAN_BUS_MCP2515
+// Library:  mcp_can 1.5.1 (coryjfowler) — this is what `#include <mcp_can.h>`
+//           resolves to for the Leonardo build (checked with arduino-cli -v).
 //
 // Sends:
 //   0x69  CRUISE_STALK   at 20 Hz — 3 bytes: button event + MAIN state + checksum
 //   0x614 BLINKERS_STATE at 20 Hz — 8 bytes: TURN_SIGNALS (1=left, 2=right, 3=none)
+//   0x501 RETROFIT_STALK_DIAG at 2 Hz — boot count, reset cause, CAN health
+//         (layout in the DIAGNOSTICS section; decoded by openpilot's DBC)
+//
+// Fault handling:
+//   - Hardware watchdog (500 ms). A hung loop or a hung library call resets the
+//     board; the watchdog interrupt records which phase it hung in (EEPROM) so the
+//     next 0x501 frame reports it.
+//   - CAN controller recovery. If nothing has been sent successfully for
+//     TX_STUCK_MS, or the MCP2515 has left normal mode, the controller is
+//     re-initialized. Any recovery or reboot comes back with MAIN off, so the
+//     emulator turns cruise fully off — a stalk fault never leaves cruise or
+//     Always-On Lateral running without a working stalk.
 //
 // Relay behavior:
 //   The stalk's 2 analog wires are routed through a DPDT relay.
@@ -39,7 +51,9 @@
 // ============================================================================
 
 #include <SPI.h>
-#include <mcp_can.h>  // Longan Labs MCP2515 library
+#include <EEPROM.h>
+#include <avr/wdt.h>
+#include <mcp_can.h>  // coryjfowler mcp_can 1.5.1
 
 // ============================================================================
 // CONFIGURATION
@@ -119,6 +133,74 @@ static_assert(STALK_RES_MAX    < STALK_MAIN_MIN, "RES and MAIN ranges overlap");
 #define INTERVAL_20HZ    50000  // 50ms = 20 Hz
 #define HEARTBEAT_MS     2000
 
+// ============================================================================
+// DIAGNOSTICS + FAULT RECOVERY
+//
+// 0x501 RETROFIT_STALK_DIAG (8 bytes, 2 Hz + once right after boot):
+//   byte 0      BOOT_COUNT       increments every boot (EEPROM), wraps at 255
+//   byte 1 hi   ROLLING_COUNTER  4-bit, increments per frame (not named COUNTER on
+//                                purpose: openpilot's parser would treat a jump
+//                                after a reboot as a CAN error)
+//   byte 1 lo   RESET_KIND       why the board last started (RESET_* below)
+//   byte 2 hi   RESET_PHASE      loop phase the watchdog caught it in (PHASE_*)
+//   byte 2 3:2  RECOVERY_REASON  last CAN controller recovery (RECOVER_*)
+//   byte 2 b1   C3_PRESENT       0x2E4 seen (relay energized)
+//   byte 2 b0   MAIN_ON
+//   byte 3      CAN_ERROR_FLAGS  MCP2515 EFLG, OR-latched since the last frame
+//   byte 4      TX_FAILS         failed sends since the last frame (saturates)
+//   byte 5 hi   INIT_RETRIES     failed CAN init attempts at boot (saturates at 15)
+//   byte 5 lo   CAN_RECOVERIES   controller re-inits since boot (saturates at 15)
+//   byte 6      LOOP_MAX_MS      slowest loop() since the last frame (saturates)
+//   byte 7      CHECKSUM         toyota_checksum
+// ============================================================================
+
+#define DIAG_CAN_ID          0x501
+#define DIAG_INTERVAL_MS     500
+#define HEALTH_INTERVAL_MS   100   // CAN controller health check period
+#define TX_STUCK_MS          500   // no successful send for this long → re-init controller
+#define RECOVERY_RETRY_MS    500   // minimum spacing between re-init attempts
+#define RECOVERY_MAX_FAILS   5     // consecutive failed re-inits → deliberate reset
+
+// EEPROM layout
+#define EE_BOOT_COUNT   0
+#define EE_RESET_CAUSE  1   // written just before a watchdog/deliberate reset
+#define EE_RESET_PHASE  2
+
+// RESET_KIND values (shared by all three retrofit ECUs)
+#define RESET_UNKNOWN     0  // power-on or brown-out: the bootloader clears MCUSR, so these
+                             // can't be told apart here. On the CANBed (Caterina) a
+                             // brown-out also holds the board in the bootloader ~8 s,
+                             // so the gap length in the log separates the two.
+#define RESET_POWER_ON    1  // from MCUSR (only when no bootloader cleared it)
+#define RESET_BROWN_OUT   2
+#define RESET_EXTERNAL    3
+#define RESET_WATCHDOG    4
+#define RESET_DELIBERATE  5  // gave up recovering the CAN controller
+
+// RESET_PHASE values: what the loop was doing (recorded by the watchdog interrupt)
+#define PHASE_SETUP      1
+#define PHASE_CAN_INIT   2
+#define PHASE_CAN_RX     3
+#define PHASE_STALK      4
+#define PHASE_CAN_TX     5
+#define PHASE_HEALTH     6
+#define PHASE_SERIAL     7
+#define PHASE_RECOVERY   8
+#define PHASE_LOOP       9
+
+// RECOVERY_REASON values
+#define RECOVER_NONE      0
+#define RECOVER_TX_STUCK  1  // nothing sent successfully for TX_STUCK_MS
+#define RECOVER_MODE      2  // MCP2515 left normal mode (e.g. it reset on its own)
+#define RECOVER_BUS_OFF   3  // TX stuck while the controller reported bus-off
+
+// MCP2515 registers not exposed by the library's public API
+#define REG_CANSTAT      0x0E
+#define REG_EFLG         0x2D
+#define CANSTAT_OPMOD    0xE0  // bits 7:5, 000 = normal
+#define EFLG_RX_OVERFLOW 0xC0  // RX1OVR | RX0OVR (latched until cleared)
+#define EFLG_TXBO        0x20
+
 // SET/RES auto-repeat: after holding for REPEAT_DELAY_MS, repeat every REPEAT_INTERVAL_MS
 #define REPEAT_DELAY_MS     500   // Initial hold before repeating starts
 #define REPEAT_INTERVAL_MS  200   // Repeat rate once held (5 km/h per second)
@@ -158,6 +240,25 @@ uint8_t turnSignals = 3;  // default: none
 // TX stats
 uint32_t txOk    = 0;
 uint32_t txError = 0;
+
+// Diagnostics state
+uint8_t bootCount = 0;
+uint8_t resetKind = RESET_UNKNOWN;
+uint8_t resetPhase = 0;
+volatile uint8_t currentPhase = PHASE_SETUP;  // read by the watchdog interrupt
+uint8_t diagRolling = 0;
+uint8_t eflgLatched = 0;
+uint8_t txFailsSinceDiag = 0;
+uint8_t initRetries = 0;
+uint8_t canRecoveries = 0;
+uint8_t lastRecoveryReason = RECOVER_NONE;
+uint8_t recoveryFailStreak = 0;
+unsigned long loopMaxUs = 0;
+unsigned long lastTxOkMs = 0;
+unsigned long lastHealthMs = 0;
+unsigned long lastRecoveryMs = 0;
+unsigned long lastDiagMs = 0;
+bool diagDue = true;  // send one right after boot
 
 // ============================================================================
 // STALK READING
@@ -254,12 +355,15 @@ uint8_t toyota_checksum(uint16_t address, uint8_t *data, uint8_t len) {
 // ============================================================================
 
 bool sendMsg(uint16_t id, uint8_t *data, uint8_t len) {
+  currentPhase = PHASE_CAN_TX;
   byte result = CAN.sendMsgBuf(id, 0, len, data);
   if (result == CAN_OK) {
     txOk++;
+    lastTxOkMs = millis();
     return true;
   } else {
     txError++;
+    if (txFailsSinceDiag < 255) txFailsSinceDiag++;
     return false;
   }
 }
@@ -334,6 +438,8 @@ void check_can_receive() {
 
   unsigned long nowMs = millis();
 
+  currentPhase = PHASE_CAN_RX;
+
   // Hardware filter guarantees every received frame is 0x2E4
   while (CAN.checkReceive() == CAN_MSGAVAIL) {
     unsigned long rxId;
@@ -380,10 +486,192 @@ void check_can_receive() {
 }
 
 // ============================================================================
+// WATCHDOG
+// Interrupt-then-reset mode: the first 500 ms timeout runs WDT_vect, which records
+// the phase the loop was stuck in, then forces the reset. The bootloader clears
+// MCUSR, so EEPROM is the only record of a watchdog reset that survives it.
+// ============================================================================
+
+ISR(WDT_vect) {
+  eeprom_write_byte((uint8_t *)EE_RESET_CAUSE, RESET_WATCHDOG);
+  eeprom_write_byte((uint8_t *)EE_RESET_PHASE, currentPhase);
+  wdt_enable(WDTO_15MS);  // plain reset mode, fires almost immediately
+  while (true) {}
+}
+
+void watchdog_arm() {
+  cli();
+  wdt_reset();
+  WDTCSR = _BV(WDCE) | _BV(WDE);
+  WDTCSR = _BV(WDIE) | _BV(WDE) | _BV(WDP2) | _BV(WDP0);  // 500 ms, interrupt then reset
+  sei();
+}
+
+// Reset on purpose (CAN controller could not be recovered). Recorded like a watchdog
+// reset so the next boot reports it.
+void deliberate_reset() {
+  Serial.println(F("CAN recovery failed repeatedly — resetting board"));
+  eeprom_write_byte((uint8_t *)EE_RESET_CAUSE, RESET_DELIBERATE);
+  eeprom_write_byte((uint8_t *)EE_RESET_PHASE, PHASE_RECOVERY);
+  cli();
+  wdt_enable(WDTO_15MS);
+  while (true) {}
+}
+
+// Work out why we booted, then clear the record for next time.
+void diag_boot() {
+  uint8_t mcusr = MCUSR;
+  MCUSR = 0;
+  uint8_t cause = eeprom_read_byte((uint8_t *)EE_RESET_CAUSE);
+  if (cause == RESET_WATCHDOG || cause == RESET_DELIBERATE) {
+    resetKind = cause;
+    resetPhase = eeprom_read_byte((uint8_t *)EE_RESET_PHASE) & 0x0F;
+  } else if (mcusr & _BV(WDRF)) {
+    resetKind = RESET_WATCHDOG;
+  } else if (mcusr & _BV(BORF)) {
+    resetKind = RESET_BROWN_OUT;
+  } else if (mcusr & _BV(EXTRF)) {
+    resetKind = RESET_EXTERNAL;
+  } else if (mcusr & _BV(PORF)) {
+    resetKind = RESET_POWER_ON;
+  } else {
+    resetKind = RESET_UNKNOWN;
+  }
+  if (cause != 0) {
+    EEPROM.update(EE_RESET_CAUSE, 0);
+    EEPROM.update(EE_RESET_PHASE, 0);
+  }
+  bootCount = EEPROM.read(EE_BOOT_COUNT) + 1;
+  EEPROM.update(EE_BOOT_COUNT, bootCount);
+}
+
+// ============================================================================
+// CAN CONTROLLER INIT + HEALTH
+// ============================================================================
+
+uint8_t mcp_read_register(uint8_t address) {
+  SPI.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0));
+  digitalWrite(CAN_CS_PIN, LOW);
+  SPI.transfer(0x03);  // READ
+  SPI.transfer(address);
+  uint8_t value = SPI.transfer(0x00);
+  digitalWrite(CAN_CS_PIN, HIGH);
+  SPI.endTransaction();
+  return value;
+}
+
+void mcp_modify_register(uint8_t address, uint8_t mask, uint8_t data) {
+  SPI.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0));
+  digitalWrite(CAN_CS_PIN, LOW);
+  SPI.transfer(0x05);  // BIT MODIFY
+  SPI.transfer(address);
+  SPI.transfer(mask);
+  SPI.transfer(data);
+  digitalWrite(CAN_CS_PIN, HIGH);
+  SPI.endTransaction();
+}
+
+// Bring the MCP2515 up in normal mode with the 0x2E4 filter. Used at boot and for
+// recovery. Returns false if any step failed (caller retries).
+bool can_init() {
+  currentPhase = PHASE_CAN_INIT;
+
+  // Use MCP_STDEXT so MCP2515 masks/filters stay enabled. MCP_ANY disables
+  // hardware filtering, and MCP_STD is broken/commented out in this library.
+  //
+  // begin() configures baud rate then tries to enter loopback mode before returning.
+  // On a live bus that loopback step can fail ("Returning to Previous Mode Failure")
+  // even though config/baud succeeded, so continue to an explicit NORMAL mode check.
+  byte beginResult = CAN.begin(MCP_STDEXT, CAN_500KBPS, MCP_16MHZ);
+  if (beginResult != CAN_OK) {
+    Serial.print(F("CAN begin warning/result: "));
+    Serial.println(beginResult);
+  }
+  wdt_reset();
+
+  // Switch to normal mode BEFORE filter setup so init_Mask returns here, not loopback.
+  if (CAN.setMode(MCP_NORMAL) != MCP2515_OK) {
+    Serial.println(F("CAN setMode(NORMAL) failed — check MCP2515 wiring/SPI"));
+    return false;
+  }
+  if (!setup_c3_rx_filter()) {
+    return false;
+  }
+  lastTxOkMs = millis();  // give the fresh controller a full TX_STUCK_MS window
+  return true;
+}
+
+// Re-initialize the controller after a fault. Cruise always comes back with MAIN
+// off: during the outage the emulator either saw no frames (and turned cruise off
+// after 1 s) or is about to see MAIN fall — either way both sides agree on OFF.
+void can_recover(uint8_t reason) {
+  currentPhase = PHASE_RECOVERY;
+  lastRecoveryMs = millis();
+  lastRecoveryReason = reason;
+  if (canRecoveries < 255) canRecoveries++;
+
+  Serial.print(F("CAN recovery, reason "));
+  Serial.println(reason);
+
+  mainOn = false;
+  pendingEvent = BTN_NONE;
+
+  if (can_init()) {
+    recoveryFailStreak = 0;
+    diagDue = true;
+  } else if (++recoveryFailStreak >= RECOVERY_MAX_FAILS) {
+    deliberate_reset();
+  }
+}
+
+void can_health_check(unsigned long nowMs) {
+  currentPhase = PHASE_HEALTH;
+  uint8_t eflg = mcp_read_register(REG_EFLG);
+  eflgLatched |= eflg;
+  if (eflg & EFLG_RX_OVERFLOW) {
+    mcp_modify_register(REG_EFLG, EFLG_RX_OVERFLOW, 0x00);  // overflow flags latch until cleared
+  }
+
+  uint8_t reason = RECOVER_NONE;
+  if ((mcp_read_register(REG_CANSTAT) & CANSTAT_OPMOD) != 0) {
+    reason = RECOVER_MODE;
+  } else if (nowMs - lastTxOkMs >= TX_STUCK_MS) {
+    reason = (eflg & EFLG_TXBO) ? RECOVER_BUS_OFF : RECOVER_TX_STUCK;
+  }
+
+  if (reason != RECOVER_NONE && nowMs - lastRecoveryMs >= RECOVERY_RETRY_MS) {
+    can_recover(reason);
+  }
+}
+
+void send_diag() {
+  unsigned long loopMaxMs = loopMaxUs / 1000;
+  uint8_t data[8];
+  data[0] = bootCount;
+  data[1] = (uint8_t)((diagRolling & 0x0F) << 4) | (resetKind & 0x0F);
+  data[2] = (uint8_t)((resetPhase & 0x0F) << 4) | ((lastRecoveryReason & 0x03) << 2) |
+            (c3Present ? 0x02 : 0x00) | (mainOn ? 0x01 : 0x00);
+  data[3] = eflgLatched;
+  data[4] = txFailsSinceDiag;
+  data[5] = (uint8_t)(min(initRetries, (uint8_t)15) << 4) | min(canRecoveries, (uint8_t)15);
+  data[6] = loopMaxMs > 255 ? 255 : (uint8_t)loopMaxMs;
+  data[7] = toyota_checksum(DIAG_CAN_ID, data, 8);
+  sendMsg(DIAG_CAN_ID, data, 8);
+
+  diagRolling = (diagRolling + 1) & 0x0F;
+  eflgLatched = 0;
+  txFailsSinceDiag = 0;
+  loopMaxUs = 0;
+}
+
+// ============================================================================
 // SETUP
 // ============================================================================
 
 void setup() {
+  diag_boot();
+  watchdog_arm();
+
   Serial.begin(115200);
   Serial.println(F("Cruise Stalk Device starting..."));
 
@@ -400,6 +688,12 @@ void setup() {
   pinMode(BLINKER_LEFT_PIN, INPUT_PULLUP);
   pinMode(BLINKER_RIGHT_PIN, INPUT_PULLUP);
 
+  Serial.print(F("Boot #"));
+  Serial.print(bootCount);
+  Serial.print(F("  reset kind "));
+  Serial.print(resetKind);
+  Serial.print(F("  phase "));
+  Serial.println(resetPhase);
   Serial.print(F("Stalk pin: A"));
   Serial.println(STALK_PIN - A0);
   Serial.print(F("Relay pin: D"));
@@ -412,28 +706,18 @@ void setup() {
   Serial.print(C3_TIMEOUT_MS);
   Serial.println(F("ms"));
 
-  // Use MCP_STDEXT so MCP2515 masks/filters stay enabled. MCP_ANY disables
-  // hardware filtering, and MCP_STD is broken/commented out in this library.
-  //
-  // begin() configures baud rate then tries to enter loopback mode before returning.
-  // On a live bus that loopback step can fail ("Returning to Previous Mode Failure")
-  // even though config/baud succeeded, so continue to an explicit NORMAL mode check.
-  byte beginResult = CAN.begin(MCP_STDEXT, CAN_500KBPS, MCP_16MHZ);
-  if (beginResult != CAN_OK) {
-    Serial.print(F("CAN begin warning/result: "));
-    Serial.println(beginResult);
-  }
-
-  // Switch to normal mode BEFORE filter setup so init_Mask returns here, not loopback.
-  if (CAN.setMode(MCP_NORMAL) != MCP2515_OK) {
-    Serial.println(F("CAN setMode(NORMAL) failed — check MCP2515 wiring/SPI"));
-    while (true) { delay(1000); }
-  }
-  if (!setup_c3_rx_filter()) {
-    Serial.println(F("Halting: 0x2E4 hardware filter is required for robust C3 detection"));
-    while (true) { delay(1000); }
+  // Keep retrying instead of halting: a halt here used to leave the board silent
+  // until power-cycled. The watchdog still catches a call that never returns.
+  while (!can_init()) {
+    if (initRetries < 255) initRetries++;
+    Serial.println(F("CAN init failed, retrying..."));
+    for (uint8_t i = 0; i < 4; i++) {
+      wdt_reset();
+      delay(50);
+    }
   }
   Serial.println(F("CAN BUS init ok — RX filter 0x2E4 only, sending 0x69 at 20 Hz"));
+  currentPhase = PHASE_LOOP;
 }
 
 // ============================================================================
@@ -441,14 +725,17 @@ void setup() {
 // ============================================================================
 
 void loop() {
+  wdt_reset();
   unsigned long now = micros();
   unsigned long nowMs = now / 1000;
+  currentPhase = PHASE_LOOP;
 
   // Check for C3 presence and manage relay
   check_can_receive();
 
   // Only read stalk when relay is energized (stalk wired to A0)
   if (c3Present) {
+    currentPhase = PHASE_STALK;
     uint8_t btn = read_stalk();
     if (btn != BTN_NONE) {
       pendingEvent = btn;  // Latch event for next CAN frame
@@ -467,8 +754,22 @@ void loop() {
     send_blinkers_state(turnSignals);
   }
 
+  // --- CAN controller health (recovers a stuck or reset MCP2515) ---
+  if (nowMs - lastHealthMs >= HEALTH_INTERVAL_MS) {
+    lastHealthMs = nowMs;
+    can_health_check(nowMs);
+  }
+
+  // --- 2 Hz: diagnostics frame ---
+  if (diagDue || nowMs - lastDiagMs >= DIAG_INTERVAL_MS) {
+    diagDue = false;
+    lastDiagMs = nowMs;
+    send_diag();
+  }
+
   // --- Heartbeat ---
   if (nowMs - lastMillis_hb >= HEARTBEAT_MS) {
+    currentPhase = PHASE_SERIAL;
     lastMillis_hb = nowMs;
     Serial.print(F("MAIN: "));
     Serial.print(mainOn ? "ON" : "OFF");
@@ -493,6 +794,13 @@ void loop() {
     Serial.print(F("  TX ok: "));
     Serial.print(txOk);
     Serial.print(F("  err: "));
-    Serial.println(txError);
+    Serial.print(txError);
+    Serial.print(F("  boot: "));
+    Serial.print(bootCount);
+    Serial.print(F("  recov: "));
+    Serial.println(canRecoveries);
   }
+
+  unsigned long loopUs = micros() - now;
+  if (loopUs > loopMaxUs) loopMaxUs = loopUs;
 }
