@@ -253,22 +253,24 @@ uint8_t toyota_checksum(uint16_t address, uint8_t *data, uint8_t len) {
 // CAN SEND
 // ============================================================================
 
-void sendMsg(uint16_t id, uint8_t *data, uint8_t len) {
+bool sendMsg(uint16_t id, uint8_t *data, uint8_t len) {
   byte result = CAN.sendMsgBuf(id, 0, len, data);
   if (result == CAN_OK) {
     txOk++;
+    return true;
   } else {
     txError++;
+    return false;
   }
 }
 
 // Send 0x69: byte 0 = button event, byte 1 = MAIN state, byte 2 = toyota_checksum
-void send_stalk_msg(uint8_t button_event) {
+bool send_stalk_msg(uint8_t button_event) {
   uint8_t data[3];
   data[0] = button_event;
   data[1] = mainOn ? 1 : 0;
   data[2] = toyota_checksum(STALK_CAN_ID, data, 3);
-  sendMsg(STALK_CAN_ID, data, 3);
+  return sendMsg(STALK_CAN_ID, data, 3);
 }
 
 // 0x614 — BLINKERS_STATE (8 bytes, no checksum)
@@ -459,8 +461,9 @@ void loop() {
   // --- 20 Hz: send stalk + blinker CAN messages ---
   if (now - lastMicros_20hz >= INTERVAL_20HZ) {
     lastMicros_20hz = now;
-    send_stalk_msg(pendingEvent);
-    pendingEvent = BTN_NONE;  // Clear after sending (pulse behavior)
+    if (send_stalk_msg(pendingEvent)) {
+      pendingEvent = BTN_NONE;
+    }
     send_blinkers_state(turnSignals);
   }
 
