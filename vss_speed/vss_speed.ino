@@ -41,7 +41,7 @@
 //               un-bumped sketch still shows up as a different build)
 // ============================================================================
 
-#define FW_VERSION      "092826a"
+#define FW_VERSION      "092826b"
 #define VERSION_CAN_ID  0x505
 static_assert(sizeof(FW_VERSION) - 1 == 7, "FW_VERSION must be 7 characters: MMDDYY + one of a-z/0-9");
 
@@ -430,9 +430,15 @@ void loop() {
   uint8_t currentIdx = vssRingIdx;
   unsigned long ring[VSS_RING_SIZE];
   for (uint8_t i = 0; i < VSS_RING_SIZE; i++) ring[i] = vssPeriodRing[i];
+  // Age measured from a timestamp taken AFTER the copy. With the loop-top `now`, a
+  // pulse landing between micros() and this copy made lastPulse newer than now, the
+  // unsigned age wrapped to ~4e9 us, and the stale branch zeroed the speed — the
+  // speed then climbed back 1/3 per pulse (EMA from 0). Seen every ~0.7 s in route
+  // 0000037d (2026-09-28).
+  unsigned long pulseAgeUs = micros() - lastPulse;
   interrupts();
 
-  if (!hasPulse || (now - lastPulse) > VSS_STALE_US) {
+  if (!hasPulse || pulseAgeUs > VSS_STALE_US) {
     rawSpeedKmh100 = 0;
     smoothedX256 = 0;
   } else {
