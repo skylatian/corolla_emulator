@@ -41,7 +41,7 @@
 //               un-bumped sketch still shows up as a different build)
 // ============================================================================
 
-#define FW_VERSION      "092726a"
+#define FW_VERSION      "092826a"
 #define VERSION_CAN_ID  0x505
 static_assert(sizeof(FW_VERSION) - 1 == 7, "FW_VERSION must be 7 characters: MMDDYY + one of a-z/0-9");
 
@@ -479,7 +479,10 @@ void loop() {
   // --- CAN controller health + 2 Hz diagnostics frame ---
   if (nowMs - lastHealthMs >= HEALTH_INTERVAL_MS) {
     lastHealthMs = nowMs;
-    can_health_check(nowMs);
+    // Fresh millis(), not the loop-top nowMs: sends earlier in this loop stamp
+    // lastTxOkMs with millis(), which can be ahead of nowMs; nowMs - lastTxOkMs
+    // then wrapped to ~4e9 and faked a "TX stuck" recovery (seen 2026-09-28).
+    can_health_check(millis());
   }
   if (diagDue || nowMs - lastDiagMs >= DIAG_INTERVAL_MS) {
     diagDue = false;
