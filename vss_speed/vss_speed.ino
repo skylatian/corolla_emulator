@@ -41,7 +41,7 @@
 //               un-bumped sketch still shows up as a different build)
 // ============================================================================
 
-#define FW_VERSION      "092826b"
+#define FW_VERSION      "100926a"
 #define VERSION_CAN_ID  0x505
 static_assert(sizeof(FW_VERSION) - 1 == 7, "FW_VERSION must be 7 characters: MMDDYY + one of a-z/0-9");
 
@@ -50,9 +50,26 @@ static_assert(sizeof(FW_VERSION) - 1 == 7, "FW_VERSION must be 7 characters: MMD
 // ============================================================================
 
 #define VSS_PIN            3     // VSS signal input (must support hardware interrupt)
-// Speed fit: speed_kph = 1.45*pps - 1.81 (pps >= 1), else speed_kph = pps
-#define VSS_STALE_US       2000000UL  // No pulse for this long → speed = 0
-#define VSS_RING_SIZE      8          // Period averaging ring buffer length
+// Speed fit: speed_kph = 1.45*pps - 1.81 for pps >= VSS_LOW_PPS; below that a straight
+// line through zero that meets the fit at VSS_LOW_PPS (1.09 kph). The old pps < 1
+// fallback (speed = pps) was only there to avoid negative values and made the curve
+// jump back up below 1 pps.
+//
+// Speed pipeline (2026-10-09, see project_docs/phase3-emulator-2026-09-27-ecu-diagnostics.md):
+//   1. average the pulse periods inside the last VSS_WINDOW_US (at least 2 pulses, at
+//      most VSS_RING_SIZE) — the same ~0.2 s of data at speed as the old fixed 8-period
+//      average, but only the newest pulses near a stop instead of several seconds' worth
+//   2. EMA per pulse (EMA_K)
+//   3. ceiling from the time since the last pulse: if no pulse for t, the car can't be
+//      faster than one pulse per t, so the output falls as soon as pulses stop coming
+//   4. no pulse for VSS_STOP_US → 0 (standstill); VSS_STALE_US also resets the EMA
+// Offline replay of route 0000037d: stops reached 0 ~0.5 s after the last pulse
+// (was ~2.0 s); cruising speed changed by 0.29 kph on average.
+#define VSS_STALE_US       2000000UL  // No pulse for this long → EMA reset
+#define VSS_STOP_US        500000UL   // No pulse for this long → report 0 (ceiling is ~1.1 kph by then)
+#define VSS_WINDOW_US      250000UL   // Period averaging window
+#define VSS_LOW_PPS        2.0f       // Below this pps, the fit is a line through zero
+#define VSS_RING_SIZE      8          // Pulse timestamps kept (max pulses averaged)
 #define EMA_K              3          // Output smoothing: smooth += (raw - smooth) / K per pulse
                                       // K=2: fast (50%), K=3: moderate (33%), K=4: smooth (25%)
 #define CAN_CS_PIN         17         // CANBed V1 onboard MCP2515 CS pin
@@ -132,14 +149,15 @@ unsigned long lastMillis_hb   = 0;
 
 MCP_CAN CAN(CAN_CS_PIN);
 
-volatile unsigned long vssPeriodRing[VSS_RING_SIZE];
-volatile uint8_t vssRingIdx = 0;
-volatile unsigned long vssLastPulseMicros = 0;
-volatile bool vssHasPulse = false;
-uint16_t speedKmh100 = 0;     // smoothed speed in km/h * 100 (sent on CAN)
+volatile unsigned long vssPulseTimes[VSS_RING_SIZE];  // micros() of the most recent pulses
+volatile uint8_t vssRingIdx = 0;      // next slot to write
+volatile uint8_t vssPulseStored = 0;  // valid entries (saturates at VSS_RING_SIZE)
+volatile uint8_t vssPulseSeq = 0;     // increments every pulse (wraps); triggers the EMA step
+uint16_t speedKmh100 = 0;     // speed in km/h * 100 (sent on CAN)
 uint16_t rawSpeedKmh100 = 0;  // unfiltered speed computation
 uint32_t smoothedX256 = 0;    // EMA fixed-point state (speed*100 << 8)
-uint8_t lastRingIdx = 0;      // pulse arrival tracking for EMA
+uint8_t lastPulseSeq = 0;     // pulse arrival tracking for EMA
+unsigned long avgPeriodUs = 0;  // averaged pulse period, 0 until two pulses
 uint8_t gearState = 0;     // DBC GEAR value: 0=D, 16=R, 32=P
 
 // TX stats
@@ -167,14 +185,20 @@ bool diagDue = true;
 // ============================================================================
 
 void vssISR() {
-  unsigned long now = micros();
-  if (vssHasPulse) {
-    vssPeriodRing[vssRingIdx] = now - vssLastPulseMicros;
-    vssRingIdx = (vssRingIdx + 1) % VSS_RING_SIZE;
-  }
-  vssLastPulseMicros = now;
-  vssHasPulse = true;
+  vssPulseTimes[vssRingIdx] = micros();
+  vssRingIdx = (vssRingIdx + 1) % VSS_RING_SIZE;
+  if (vssPulseStored < VSS_RING_SIZE) vssPulseStored++;
+  vssPulseSeq++;
   vssPulseCount++;
+}
+
+// Pulses per second -> km/h * 100, monotonic, clamped to the uint16 range.
+uint16_t pps_to_kmh100(float pps) {
+  float kph = (pps >= VSS_LOW_PPS) ? (1.45f * pps - 1.81f)
+                                   : pps * ((1.45f * VSS_LOW_PPS - 1.81f) / VSS_LOW_PPS);
+  if (kph <= 0.0f) return 0;
+  if (kph > 655.0f) kph = 655.0f;
+  return (uint16_t)(kph * 100.0f + 0.5f);
 }
 
 // ============================================================================
@@ -404,8 +428,11 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(VSS_PIN), vssISR, FALLING);
   Serial.print(F("VSS pin: "));
   Serial.println(VSS_PIN);
-  Serial.println(F("Speed: period measurement, ring="));
-  Serial.println(VSS_RING_SIZE);
+  Serial.print(F("Speed: period window "));
+  Serial.print(VSS_WINDOW_US / 1000);
+  Serial.print(F(" ms, standstill after "));
+  Serial.print(VSS_STOP_US / 1000);
+  Serial.println(F(" ms without a pulse"));
 
   // Init onboard MCP2515
   while (!can_init()) {
@@ -423,43 +450,55 @@ void loop() {
   unsigned long now = micros();
   unsigned long nowMs = now / 1000;
 
-  // --- VSS speed calculation (period measurement) ---
+  // --- VSS speed calculation (period measurement; pipeline in the CONFIGURATION notes) ---
   noInterrupts();
-  bool hasPulse = vssHasPulse;
-  unsigned long lastPulse = vssLastPulseMicros;
-  uint8_t currentIdx = vssRingIdx;
-  unsigned long ring[VSS_RING_SIZE];
-  for (uint8_t i = 0; i < VSS_RING_SIZE; i++) ring[i] = vssPeriodRing[i];
-  // Age measured from a timestamp taken AFTER the copy. With the loop-top `now`, a
-  // pulse landing between micros() and this copy made lastPulse newer than now, the
-  // unsigned age wrapped to ~4e9 us, and the stale branch zeroed the speed — the
-  // speed then climbed back 1/3 per pulse (EMA from 0). Seen every ~0.7 s in route
-  // 0000037d (2026-09-28).
-  unsigned long pulseAgeUs = micros() - lastPulse;
+  uint8_t stored = vssPulseStored;
+  uint8_t ringIdx = vssRingIdx;
+  uint8_t pulseSeq = vssPulseSeq;
+  unsigned long times[VSS_RING_SIZE];
+  for (uint8_t i = 0; i < VSS_RING_SIZE; i++) times[i] = vssPulseTimes[i];
+  // Timestamp taken AFTER the copy. With the loop-top `now`, a pulse landing between
+  // micros() and this copy made the last pulse newer than now, the unsigned age wrapped
+  // to ~4e9 us, and the stale branch zeroed the speed (route 0000037d, 2026-09-28).
+  unsigned long nowUs = micros();
   interrupts();
 
-  if (!hasPulse || pulseAgeUs > VSS_STALE_US) {
+  // k-th most recent pulse (k = 0 is the newest)
+  #define PULSE_AGO(k) times[(uint8_t)(ringIdx + VSS_RING_SIZE - 1 - (k)) % VSS_RING_SIZE]
+  unsigned long lastPulse = stored ? PULSE_AGO(0) : 0;
+  unsigned long pulseAgeUs = nowUs - lastPulse;
+
+  if (stored == 0 || pulseAgeUs > VSS_STALE_US) {
     rawSpeedKmh100 = 0;
     smoothedX256 = 0;
+    avgPeriodUs = 0;
   } else {
-    unsigned long sum = 0;
-    uint8_t count = 0;
-    for (uint8_t i = 0; i < VSS_RING_SIZE; i++) {
-      if (ring[i] > 0) { sum += ring[i]; count++; }
+    if (stored >= 2) {
+      // Oldest pulse to use: at least one period, then every pulse within the window.
+      uint8_t k = 1;
+      while (k + 1 < stored && lastPulse - PULSE_AGO(k + 1) <= VSS_WINDOW_US) k++;
+      avgPeriodUs = (lastPulse - PULSE_AGO(k)) / k;
+      if (avgPeriodUs > 0) rawSpeedKmh100 = pps_to_kmh100(1000000.0f / (float)avgPeriodUs);
     }
-    if (count > 0) {
-      float avgPeriod = (float)sum / (float)count;
-      float pps = 1000000.0f / avgPeriod;
-      float speed_kph = (pps >= 1.0f) ? (1.45f * pps - 1.81f) : pps;
-      rawSpeedKmh100 = (speed_kph > 0.0f) ? (uint16_t)(speed_kph * 100.0f + 0.5f) : 0;
-    }
-    if (currentIdx != lastRingIdx) {
-      lastRingIdx = currentIdx;
+    if (pulseSeq != lastPulseSeq) {
+      lastPulseSeq = pulseSeq;
       int32_t error = (int32_t)rawSpeedKmh100 * 256 - (int32_t)smoothedX256;
       smoothedX256 += error / EMA_K;
     }
   }
   speedKmh100 = (uint16_t)(smoothedX256 / 256);
+
+  // Pulses stopping: cap the speed at one pulse per elapsed time, and call it standstill
+  // after VSS_STOP_US. The EMA keeps its state, so a car that was only rolling slowly
+  // carries on from where it was when the next pulse arrives.
+  if (stored > 0 && pulseAgeUs <= VSS_STALE_US) {
+    if (pulseAgeUs > VSS_STOP_US) {
+      speedKmh100 = 0;
+    } else if (avgPeriodUs > 0 && pulseAgeUs > avgPeriodUs) {
+      uint16_t ceiling = pps_to_kmh100(1000000.0f / (float)pulseAgeUs);
+      if (ceiling < speedKmh100) speedKmh100 = ceiling;
+    }
+  }
 
   // --- Gear selection (every loop — digitalRead is ~4µs) ---
   gearState = read_gear();
