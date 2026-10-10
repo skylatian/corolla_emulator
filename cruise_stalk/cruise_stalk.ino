@@ -69,7 +69,7 @@
 //               un-bumped sketch still shows up as a different build)
 // ============================================================================
 
-#define FW_VERSION      "092826a"
+#define FW_VERSION      "100926a"
 #define VERSION_CAN_ID  0x504
 static_assert(sizeof(FW_VERSION) - 1 == 7, "FW_VERSION must be 7 characters: MMDDYY + one of a-z/0-9");
 
@@ -525,6 +525,16 @@ void watchdog_arm() {
   sei();
 }
 
+// Use this instead of wdt_reset() everywhere except watchdog_arm(). To start an
+// upload, the USB core (CDC.cpp, 1200-baud touch) switches the watchdog to a plain
+// 120 ms reset, which clears WDIE, and expects it to expire into the bootloader.
+// Petting it then would keep the board in the sketch and the upload would fail
+// ("initialization failed"). If the core cancels the reset it restores our WDTCSR,
+// WDIE comes back, and petting resumes.
+void watchdog_pet() {
+  if (WDTCSR & _BV(WDIE)) wdt_reset();
+}
+
 // Reset on purpose (CAN controller could not be recovered). Recorded like a watchdog
 // reset so the next boot reports it.
 void deliberate_reset() {
@@ -605,7 +615,7 @@ bool can_init() {
     Serial.print(F("CAN begin warning/result: "));
     Serial.println(beginResult);
   }
-  wdt_reset();
+  watchdog_pet();
 
   // Switch to normal mode BEFORE filter setup so init_Mask returns here, not loopback.
   if (CAN.setMode(MCP_NORMAL) != MCP2515_OK) {
@@ -776,7 +786,7 @@ void setup() {
     if (initRetries < 255) initRetries++;
     Serial.println(F("CAN init failed, retrying..."));
     for (uint8_t i = 0; i < 4; i++) {
-      wdt_reset();
+      watchdog_pet();
       delay(50);
     }
   }
@@ -789,7 +799,7 @@ void setup() {
 // ============================================================================
 
 void loop() {
-  wdt_reset();
+  watchdog_pet();
   unsigned long now = micros();
   unsigned long nowMs = now / 1000;
   currentPhase = PHASE_LOOP;
